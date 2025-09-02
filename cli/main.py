@@ -4,7 +4,7 @@ import click
 import os
 from dotenv import load_dotenv
 
-from core.parser import RaportParser # Изменено на RaportParser
+from core.parser import RaportParser 
 from core.plan_generator import generate_investigation_plan
 from utils.doc_formatter import create_investigation_plan_doc
 

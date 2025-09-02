@@ -1,12 +1,7 @@
-# utils/doc_formatter.py
-
 from docx import Document
 from docx.shared import Inches, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_ALIGN_VERTICAL
-from docx.oxml.ns import qn # Необходим, если придется использовать низкоуровневые настройки границ
-from docx.oxml import OxmlElement # Необходим, если придется использовать низкоуровневые настройки границ
-
 
 # Функция для отладки: читаем сохраненный документ и выводим содержимое таблицы
 def debug_read_docx_table(file_path):
@@ -35,15 +30,15 @@ def debug_read_docx_table(file_path):
         if ispolnitel_col_idx == -1:
             print("Колонка 'Исполнитель' не найдена в заголовках таблицы.")
 
-        print(f"Содержимое колонки 'Срок' (первые 5 строк):")
+        print(f"Содержимое колонок (первые 5 строк):")
         for i, row in enumerate(table.rows):
-            if i == 0: # Пропускаем заголовок
+            if i == 0:
                 continue
-            if i > 5: # Выводим только первые 5 строк для краткости
+            if i > 5:
                 break
             try:
-                cell_text_srok = row.cells[srok_col_idx].text.strip()
-                cell_text_ispolnitel = row.cells[ispolnitel_col_idx].text.strip()
+                cell_text_srok = row.cells[srok_col_idx].text.strip() if srok_col_idx != -1 else "N/A"
+                cell_text_ispolnitel = row.cells[ispolnitel_col_idx].text.strip() if ispolnitel_col_idx != -1 else "N/A"
                 print(f"  Строка {i} - Срок: '{cell_text_srok}', Исполнитель: '{cell_text_ispolnitel}'")
             except IndexError:
                 print(f"  Строка {i}: (ошибка доступа к ячейке)")
@@ -55,11 +50,10 @@ def debug_read_docx_table(file_path):
 def create_investigation_plan_doc(plan_data, output_path):
     """
     Создает документ Word (.docx) со сгенерированным планом расследования,
-    ориентируясь на формат нового образца.
+    включая колонку "Цель".
     """
     document = Document()
 
-    # Установка полей страницы (примерные значения для более плотного текста)
     sections = document.sections
     for section in sections:
         section.top_margin = Inches(0.7)
@@ -67,15 +61,11 @@ def create_investigation_plan_doc(plan_data, output_path):
         section.left_margin = Inches(0.7)
         section.right_margin = Inches(0.7)
     
-    # Доступная ширина страницы (Letter, 8.5 дюймов - 0.7*2 поля = 7.1 дюймов)
     available_width = Inches(7.1)
 
-    # ОБРАЗЕЦ
-    p = document.add_paragraph()
-    p.add_run('ОБРАЗЕЦ').bold = True
-    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    plan_title_info = plan_data.get("plan_title_info", {})
+    current_year = plan_title_info.get('год', '_______')
 
-    # УТВЕРЖДАЮ
     p = document.add_paragraph()
     p.add_run('«УТВЕРЖДАЮ»').bold = True
     p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
@@ -84,56 +74,44 @@ def create_investigation_plan_doc(plan_data, output_path):
     p.add_run('Заместитель руководитель ДЭР').bold = True
     p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
 
-    # Пустые строки для подписи
     document.add_paragraph('____________________________').alignment = WD_ALIGN_PARAGRAPH.RIGHT
     document.add_paragraph('____________________________').alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    document.add_paragraph('«_______» ____________________ 2023 г.').alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    document.add_paragraph(f'«_______» ____________________ {current_year} г.').alignment = WD_ALIGN_PARAGRAPH.RIGHT
 
-    # Заголовок ПЛАН
-    document.add_paragraph() # Пустая строка
+    document.add_paragraph()
     p = document.add_paragraph()
     p.add_run('ПЛАН').bold = True
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    # Детализация плана
-    plan_title_info = plan_data.get("plan_title_info", {})
     plan_text = document.add_paragraph(
-        f"параллельного финансового расследования уголовного дела №{plan_title_info.get('номер_дела', '_______')} "
-        f"по факту {plan_title_info.get('факт', '___________________________')} "
-        f"по ст. {plan_title_info.get('статья_ук_рк', '_______ УК РК.')}."
+        f"по уголовному делу №{plan_title_info.get('номер_дела', '_______')} "
+        #f"по факту {plan_title_info.get('факт', '___________________________')} "
+        f"по ст. {plan_title_info.get('статья_ук_рк', '_______ УК РК.')} УК РК."
     )
     plan_text.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    document.add_paragraph(f"{plan_title_info.get('год', '_______')} г.").alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    document.add_paragraph(f"{current_year} г.").alignment = WD_ALIGN_PARAGRAPH.RIGHT
 
-    document.add_paragraph() # Пустая строка перед таблицей
+    document.add_paragraph()
 
-    # --- ИЗМЕНЕНИЕ ЗДЕСЬ: ДОБАВЛЕНИЕ СТИЛЯ ТАБЛИЦЫ ---
-    # 'Table Grid' - это встроенный стиль, который обычно имеет видимые границы.
-    table = document.add_table(rows=1, cols=4, style='Table Grid') 
+    table = document.add_table(rows=1, cols=5, style='Table Grid') 
     table.autofit = False
-    table.allow_autofit = False # Добавлено для жесткого контроля ширины
+    table.allow_autofit = False
 
-    # Настройка ширины колонок (остается как есть)
-    col_width_np = Inches(0.4)   # № п.п. (очень узкая)
-    col_width_srok = Inches(1.0) # Срок (визуально узкая)
-    col_width_ispolnitel = Inches(2.3) # Исполнитель (достаточно широкая для должности и ФИО)
+    table.columns[0].width = Inches(0.3)
+    table.columns[4].width = Inches(0.8)
+    table.columns[3].width = Inches(1.5)
+    table.columns[2].width = Inches(2.0)
     
-    # Оставшаяся ширина для "Следственные действия"
-    col_width_deystviya = available_width - col_width_np - col_width_srok - col_width_ispolnitel
+    col_width_deystviya = available_width - Inches(0.3) - Inches(0.8) - Inches(1.5) - Inches(2.0)
+    table.columns[1].width = col_width_deystviya
 
-    table.columns[0].width = col_width_np
-    table.columns[1].width = col_width_deystviya # Следственные действия
-    table.columns[2].width = col_width_ispolnitel
-    table.columns[3].width = col_width_srok
-
-    # Заголовки таблицы
     hdr_cells = table.rows[0].cells
     hdr_cells[0].text = '№ п.п.'
     hdr_cells[1].text = 'Следственные действия'
-    hdr_cells[2].text = 'Исполнитель'
-    hdr_cells[3].text = 'Срок'
+    hdr_cells[2].text = 'Цель'
+    hdr_cells[3].text = 'Исполнитель'
+    hdr_cells[4].text = 'Срок'
 
-    # Применение жирного шрифта и выравнивания к заголовкам
     for cell in hdr_cells:
         for paragraph in cell.paragraphs:
             for run in paragraph.runs:
@@ -141,22 +119,19 @@ def create_investigation_plan_doc(plan_data, output_path):
             paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
             cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
 
-    # Заполнение таблицы данными
     for action in plan_data.get("actions", []):
         row_cells = table.add_row().cells
         row_cells[0].text = str(action.get("номер", ""))
         row_cells[1].text = action.get("действие", "")
-        row_cells[2].text = action.get("исполнитель", "")
-        row_cells[3].text = action.get("срок", "")
+        row_cells[2].text = action.get("цель", "")
+        row_cells[3].text = action.get("исполнитель", "")
+        row_cells[4].text = action.get("срок", "")
         
         for i, cell in enumerate(row_cells):
             for paragraph in cell.paragraphs:
-                # Номер по центру, остальные по левому краю
                 paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER if i == 0 else WD_ALIGN_PARAGRAPH.LEFT
-                # Выравнивание по верхнему краю ячейки
                 cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
 
-    # Добавление заключительных параграфов
     document.add_paragraph()
     document.add_paragraph(
         "Следственное действие должно раскрывать цель его проведения, участников и сроки исполнения, при этом, "
@@ -171,7 +146,6 @@ def create_investigation_plan_doc(plan_data, output_path):
         "следственно-оперативные мероприятия с составлением дополнительного плана."
     )
     
-    # Подписи в конце
     document.add_paragraph()
     p = document.add_paragraph()
     p.add_run('Следователь').bold = True
@@ -189,10 +163,5 @@ def create_investigation_plan_doc(plan_data, output_path):
 
     document.add_paragraph('____________________________').alignment = WD_ALIGN_PARAGRAPH.LEFT
 
-
     document.save(output_path)
     print(f"Документ плана расследования сохранен по пути: {output_path}")
-    
-    # --- НОВОЕ: Отладочный вызов чтения DOCX ---
-    debug_read_docx_table(output_path)
-    # --- КОНЕЦ НОВОГО ---

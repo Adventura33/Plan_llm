@@ -2,23 +2,51 @@
 
 import re
 import os
+from datetime import datetime, timedelta 
 
 from core.templates import INVESTIGATION_PLAN_ACTIONS
 
 # Определяем маппинг сроков здесь, напрямую в коде
-# --- ИЗМЕНЕНИЕ: ЗАМЕНА ДЛИННОГО ТИРЕ НА ОБЫЧНЫЙ ДЕФИС В СРОКАХ ---
 PERIOD_MAP = {
-  "Быстрая фиксация":             "Дни 1-10",  # Использован обычный дефис
-  "Сбор базовых доказательств":   "Дни 1-30",  # Использован обычный дефис
-  "Аналитический блок":           "Дни 15-60", # Использован обычный дефис
-  "Процессуальная фиксация":      "Дни 30-90", # Использован обычный дефис
-  "Международное сотрудничество": "Дни 60-120",# Использован обычный дефис
-  "Квалификация и обвинение":     "Дни 90-120",# Использован обычный дефис
-  "Завершение ДР":                "До дня 120",# Использован обычный дефис
+  "Быстрая фиксация":             "Дни 1-10",
+  "Сбор базовых доказательств":   "Дни 1-30",
+  "Аналитический блок":           "Дни 15-60",
+  "Процессуальная фиксация":      "Дни 30-90",
+  "Международное сотрудничество": "Дни 60-120",
+  "Квалификация и обвинение":     "Дни 90-120",
+  "Завершение ДР":                "До дня 120",
   "Параллельно":                  "Параллельно",
   "Обеспечение": "Дни 15-45"
 }
-# --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
+# --- НОВАЯ ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ---
+def calculate_due_date(start_date_str, duration_str):
+    """
+    Вычисляет конечную дату, прибавляя дни из строки-длительности к начальной дате.
+    """
+    # 1. Извлекаем дату из строки "05.10.2023г. в 17:28"
+    date_match = re.search(r'(\d{2}\.\d{2}\.\d{4})', start_date_str)
+    if not date_match:
+        return "Н/Д" # Возвращаем "недоступно", если не можем распарсить дату
+    
+    try:
+        start_date = datetime.strptime(date_match.group(1), "%d.%m.%Y")
+    except ValueError:
+        return "Н/Д"
+
+    # 2. Извлекаем максимальное количество дней из строки "Дни 1-30"
+    numbers = re.findall(r'\d+', duration_str)
+    if not numbers:
+        return duration_str # Если в строке нет чисел (например, "Параллельно"), возвращаем ее как есть
+
+    days_to_add = int(numbers[-1]) # Берем последнее число, оно будет максимальным в диапазоне
+
+    # 3. Вычисляем новую дату
+    due_date = start_date + timedelta(days=days_to_add)
+
+    # 4. Форматируем результат в "ДД.ММ.ГГГГ"
+    return due_date.strftime("%d.%m.%Y")
+# --- КОНЕЦ НОВОЙ ФУНКЦИИ ---
 
 
 def extract_main_uk_article(uk_article_string):
@@ -30,7 +58,7 @@ def extract_main_uk_article(uk_article_string):
 def generate_investigation_plan(case_data):
     """
     Генерирует детализированный план расследования на основе данных дела,
-    фильтруя действия по статье УК РК и используя предопределенный маппинг для сроков.
+    фильтруя действия по статье УК РК и вычисляя конкретные сроки.
     """
     uk_article_full = case_data.get('статья_ук_рк', 'Н/Д')
     main_uk_article = extract_main_uk_article(uk_article_full)
@@ -52,47 +80,32 @@ def generate_investigation_plan(case_data):
     filtered_actions = []
     current_number = 1
 
-    print(f"\n--- Отладка формирования действий плана ---")
     for action_template in INVESTIGATION_PLAN_ACTIONS:
         relevant_articles = action_template.get("relevant_articles", [])
 
         if not relevant_articles or (main_uk_article and main_uk_article in relevant_articles):
             action_copy = action_template.copy()
-
             action_copy["номер"] = current_number
 
+            # --- ИЗМЕНЕНИЕ: ЛОГИКА ВЫЧИСЛЕНИЯ СРОКА ---
             methodology_stage = action_copy.get("methodology_stage")
-            current_srok = ""
-
-            print(f"  Действие #{current_number}: '{action_copy['действие']}'")
-            print(f"    methodology_stage из шаблона: '{methodology_stage}'")
-            print(f"    Проверка наличия '{methodology_stage}' в загруженной методологии: {methodology_stage in methodology_durations if methodology_stage else False}")
-
+            
             if methodology_stage and methodology_stage in methodology_durations:
-                current_srok = methodology_durations[methodology_stage]
-                print(f"    Срок взят из PERIOD_MAP: '{current_srok}'")
+                duration_str = methodology_durations[methodology_stage]
+                action_copy["срок"] = calculate_due_date(actual_registration_date, duration_str)
             elif action_copy.get("срок"):
-                current_srok = action_copy.get("срок")
-                print(f"    Срок взят из шаблона (специфичный): '{current_srok}'")
+                # Если в шаблоне задан специфичный срок, оставляем его как есть
+                pass
             else:
-                current_srok = actual_registration_date
-                print(f"    Дефолтный срок (дата ЕРДР): '{current_srok}'")
-            
-            action_copy["срок"] = current_srok # <--- Убедитесь, что это кириллическая 'с'
+                # В качестве дефолтного срока используем просто дату регистрации без изменений
+                action_copy["срок"] = re.search(r'(\d{2}\.\d{2}\.\d{4})', actual_registration_date).group(1) if re.search(r'(\d{2}\.\d{2}\.\d{4})', actual_registration_date) else actual_registration_date
+            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
-            current_ispolnitel = ""
-            if action_copy.get("исполнитель"):
-                current_ispolnitel = action_copy.get("исполнитель")
-                print(f"    Исполнитель из шаблона: '{current_ispolnitel}'")
-            else:
-                current_ispolnitel = actual_investigator_full
-                print(f"    Исполнитель по умолчанию (из рапорта): '{current_ispolnitel}'")
-            
-            action_copy["исполнитель"] = current_ispolnitel
+            if not action_copy.get("исполнитель"):
+                action_copy["исполнитель"] = actual_investigator_full
 
             filtered_actions.append(action_copy)
             current_number += 1
-    print(f"--- Конец отладки формирования действий плана ---\n")
 
     plan_title_info = {
         "номер_дела": case_data.get('номер_ердр', '_______'),
