@@ -1,0 +1,36 @@
+# Секреты и конфиги окружения
+.env
+_env.file
+*.env
+
+# Виртуальные окружения и кэш Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Материалы дел и результаты — не должны попадать в git
+data/input/
+data/output/
+data/plans/
+data/cases/
+data/tasks/
+data/workspaces/
+data/mock_db/
+data/tiktoken_cache/
+data/ocr_cache/
+data/facts_cache/
+extracted_text.txt
+*.pdf
+*.docx
+!data/methodology/*.docx
+
+# Вендорная копия LightRAG (у неё свой git)
+LightRAG/
+
+# Архивы и мусор ОС/Office
+*.zip
+.DS_Store
+__MACOSX/
+~$*
