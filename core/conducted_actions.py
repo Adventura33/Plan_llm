@@ -1,0 +1,773 @@
+# core/conducted_actions.py
+"""
+Проведённые по делу следственные и процессуальные действия.
+
+1. detect_conducted_actions — по документам дела (имя файла + шапка текста) определяет, какие действия
+   уже проведены и с кем/чем: «допрос свидетеля Оспанова К.К.», «выемка у Инкербаевой А.Б.»,
+   «назначена судебно-экономическая экспертиза», «ответ из АО «Kaspi Bank»».
+2. match_conducted — сопоставляет пункт плана с проведённым действием по ТИПУ и ЛИЦУ/ОБЪЕКТУ
+   (а не только по типу: протокол допроса одного свидетеля не делает исполненными все допросы).
+3. apply_conducted_statuses — отмечает совпавшие пункты «Исполнен», а проведённые действия,
+   которых нет в плане, добавляет в план отдельными пунктами со статусом «Исполнен».
+"""
+
+import re
+import unicodedata
+from typing import Dict, List, Optional
+
+from core.case_participants import find_person_mentions, normalize_text
+
+STATUS_DONE = 'Исполнен'
+
+# Роли допрашиваемых (в родительном падеже, как в названии протокола)
+_ROLES = [
+    ('свидетеля, имеющего право на защиту', r'свидетел\w*,?\s+имеющ\w+\s+прав\w*\s+на\s+защиту'),
+    ('подозреваемого', r'подозреваем\w*'),
+    ('обвиняемого', r'обвиняем\w*'),
+    ('представителя потерпевшего', r'представител\w+\s+потерпевш\w*'),
+    ('потерпевшего', r'потерпевш\w*'),
+    ('эксперта', r'эксперт(?!из)\w*'),
+    ('специалиста', r'специалист\w*'),
+    ('свидетеля', r'свидетел\w*|куәгер\w*|куә\b'),
+]
+
+_EXPERTISE_KINDS = [
+    ('финансово-экономическая', r'финансово-эконом'),
+    ('экономическая', r'эконом'),
+    ('бухгалтерская', r'бухгалтер'),
+    ('товароведческая', r'товаровед'),
+    ('почерковедческая', r'почерковед'),
+    ('компьютерно-техническая', r'компьютерн'),
+    ('технико-криминалистическая', r'технико-криминалист'),
+    ('строительная', r'строительн'),
+    ('оценочная', r'оценочн'),
+    ('химическая', r'химическ'),
+    ('психолого-филологическая', r'психолого-филолог'),
+    ('лингвистическая', r'лингвист|филолог'),
+    ('фоноскопическая', r'фоноскоп'),
+    ('психолого-психиатрическая', r'психиатр|психолог'),
+]
+
+# Адресаты запросов (для сопоставления «Направить запрос в X» ↔ «Ответ из X»)
+_ORGANS = [
+    ('кгд', r'\bкгд\b|государственных\s+доходов|\bдгд\b|\bугд\b'),
+    ('нао', r'\bнао\b|правительство\s+для\s+граждан|госкорпораци'),
+    ('аррфр', r'аррфр|регулированию\s+и\s+развитию\s+финансового'),
+    # «Государственное кредитное бюро» — оператор ЕСБД (страхование), а не ПКБ (кредиты и залоги)
+    ('пкб', r'\bпкб\b|перво\w*\s+кредитн\w*\s+бюро'),
+    ('есбд', r'\bесбд\b|единая\s+страхов|государственн\w*\s+кредитн\w*\s+бюро'),
+    ('криптон', r'криптон'),
+    ('енпф', r'енпф|пенсионн'),
+    ('kaspi', r'kaspi|каспи'),
+    ('halyk', r'halyk|халык|народн\w+\s+банк'),
+    ('forte', r'forte|форте'),
+    ('jusan', r'jusan|jysan|жусан'),
+    ('bereke', r'bereke|береке'),
+    ('bcc', r'центркредит|\bbcc\b'),
+    ('freedom', r'freedom|фридом'),
+    ('eurasian', r'евразийск|eurasian'),
+    ('otbasy', r'отбасы|otbasy'),
+    ('home', r'home\s*credit|хоум\s*кредит'),
+    ('оператор', r'kcell|beeline|tele2|altel|казахтелеком|оператор\w*\s+(?:сотовой\s+)?связи'),
+    ('игорный_комитет', r'игорн\w*\s+бизнес|туризма\s+и\s+спорта|ойын\s+бизнес'),
+    ('оператор_лотереи', r'с[әа]тт[іи]\s+ж[ұу]лд[ыұу]з|оператор\w*\s+лотере'),
+    ('полиция', r'полици|\bуап\b|\bмвд\b|внутренних\s+дел|\bспон\b'),
+    ('meta', r'instagram|инстаграм|\bmeta\b|facebook'),
+]
+
+# Тип документа → проведённое действие. Порядок важен: более специфичные первыми.
+_DOC_TYPES = [
+    ('очная_ставка', r'пр\w{0,2}токол\w*\s+очн\w*\s+ставк'),
+    ('допрос', r'пр\w{0,2}токол\w*\s+(?:о\s+)?(?:дополнительн\w+\s+)?допрос|жауап\s+алу\s+хаттам'),
+    ('обыск', r'пр\w{0,2}токол\w*\s+(?:личного\s+)?обыск|тінту\s+хаттам'),
+    ('выемка', r'пр\w{0,2}токол\w*\s+выемк|акт\w*\s+выемк|алу\s+хаттам'),
+    ('осмотр', r'пр\w{0,2}токол\w*\s+осмотр|акт\w*\s+осмотр|қарау\s+хаттам'),
+    # «Заключение эксперта», «Заключение специалиста», а также файл, который начинается словом «Заключение»
+    # («Заключение_ГУ_«Комитет…»», «заключение__13095_(психолого-филологическая)»)
+    ('заключение', r'заключени\w*\s+(?:судебн\w+\s+)?(?:эксперт|специал)|^\W*\d*\W*заключени|сараптама\s+қорытынды'),
+    ('назначение_экспертизы', r'постановлени\w*\s+о\s+назначении\s+[\w\s-]*(?:экспертиз|экспертн\w*\s+[\w\s-]*исследовани)'),
+    ('вещдок', r'постановлени\w*\s+о\s+(?:признании|приобщении)[\w\s-]*вещественн'),
+    ('арест', r'постановлени\w*\s+о\s+(?:наложении\s+)?(?:арест|ограничени|временн\w+\s+ограничени)'),
+    # «Қаулы жәбірленуші деп тану туралы» — казахское постановление о признании потерпевшим
+    ('потерпевший', r'постановлени\w*\s+о\s+признании[\w\s-]*потерпевш|жәбірленуші\s+деп\s+тану'),
+    ('санкция', r'постановлени\w*\s+о\s+производстве\s+(?:выемк|обыск)'),
+    # «Постановление о привлечении специалиста», «привличение_специалиста_ГУ…» (с опечаткой, без слова «постановление»)
+    ('специалист', r'(?:постановлени\w*\s+о\s+)?привл\w*\s+(?:в\s+качестве\s+)?специал'),
+    ('ответ', r'ответ\w*\s+(?:на\s+запрос|из|от|с|со)\b|выпис\w*\s+(?:по\s+)?(?:счет|счёт|движени)|'
+              r'сведени\w*\s+из\s+(?:банк|кгд|нао)|справк\w*\s+(?:из\s+)?банк'),
+    # Исходящий запрос следователя («15. запрос_АО_«Сәтті_Жұлдыз»») — пункт «Направить запрос» исполнен
+    ('запрос', r'^\W*\d*\W*запрос\w*\b'),
+    # Процессуальные решения по подозреваемому (определяются только по названию файла)
+    ('подозреваемый', r'постановлени\w*\s+о\s+признании\s+(?:лица\s+)?(?:в\s+качестве\s+)?подозреваем'),
+    ('квалификация', r'постановлени\w*\s+о\s+квалификации'),
+    ('мера_пресечения', r'мер\w*\s+пресечени'),
+    ('розыск', r'розыск'),
+    ('защитник', r'постановлени\w*\s+о\s+назначении\s+защитник'),
+    ('сио_псо', r'сио\s*п\w*\s*со|сиопсо'),
+    ('установление', r'рапорт\w*[^.]{0,40}?по\s+установлени'),
+]
+
+# Типы, которые определяются только по названию файла: в тексте других документов эти слова встречаются
+# мимоходом («объявлен в розыск», «избрана мера пресечения») и сделали бы документ не тем, что он есть
+_NAME_ONLY_TYPES = {'запрос', 'подозреваемый', 'квалификация', 'мера_пресечения', 'розыск', 'защитник',
+                    'сио_псо', 'установление'}
+
+_TYPE_LABEL = {
+    'очная_ставка': 'Проведена очная ставка',
+    'допрос': 'Проведён допрос',
+    'обыск': 'Проведён обыск',
+    'выемка': 'Проведена выемка',
+    'осмотр': 'Проведён осмотр',
+    'заключение': 'Получено заключение',
+    'назначение_экспертизы': 'Назначена экспертиза',
+    'вещдок': 'Вынесено постановление о признании (приобщении) вещественных доказательств',
+    'арест': 'Вынесено постановление о наложении ареста (ограничения) на имущество',
+    'потерпевший': 'Вынесено постановление о признании потерпевшим',
+    'санкция': 'Вынесено постановление о производстве',
+    'специалист': 'Вынесено постановление о привлечении специалиста',
+    'ответ': 'Получены сведения по запросу',
+    'запрос': 'Направлен запрос',
+    'подозреваемый': 'Вынесено постановление о признании лица подозреваемым',
+    'квалификация': 'Вынесено постановление о квалификации деяния подозреваемого',
+    'мера_пресечения': 'Возбуждено ходатайство о санкционировании меры пресечения',
+    'розыск': 'Объявлен розыск',
+    'защитник': 'Вынесено постановление о назначении защитника',
+    'сио_псо': 'Проведена проверка по БД СИО ПСО',
+    'установление': 'Получен рапорт об установлении',
+}
+
+# Метки в документе, после которых указано ФИО лица, с которым проведено действие:
+# (шаблон, сколько символов может быть между меткой и ФИО)
+_PERSON_LABELS = [
+    (r'(?:фамилия,?\s*имя,?\s*отчество|ф\.\s?и\.\s?о\.?|тегі,?\s*аты,?\s*(?:әкесінің\s+аты)?)\s*(?:\([^)]*\))?\s*[:\-–]?\s*', 3),
+    # «допросил по уголовному делу № … в качестве специалиста ГУ "Отдел образования" Беркутбаева Майя Базарбаевна»
+    (r'допросил\w*[^:]{0,120}?в\s+качестве\s+[\w()]+\s*:?\s*', 80),
+    (r'допрошен\w*\s+(?:в\s+качестве\s+\w+\s+)?', 3),
+    # «Произвести выемку у исполняющего обязанности руководителя КГКП «Ясли-сад №27» Инкербаевой А.Б.»
+    (r'(?:выемк\w*|обыск\w*)\s+(?:у|в\s+жилище|по\s+месту\s+жительства)\s+(?:гр\.?\s*|гражданин\w*\s+)?', 150),
+    (r'представител\w+\s+юридическ\w+\s+лица\s*[–—-]?\s*потерпевш\w*\s*', 3),
+    (r'очн\w*\s+ставк\w*\s+между\s+', 3),
+]
+
+# Латинские буквы-двойники внутри русских слов («Пpотокол» с латинской p) — к кириллице
+_HOMOGLYPHS = str.maketrans('aceopxykmtbhACEOPXYKMTBH', 'асеорхукмтвнАСЕОРХУКМТВН')
+
+
+def _fix_homoglyphs(text: str) -> str:
+    return re.sub(r'\w+', lambda m: m.group(0).translate(_HOMOGLYPHS)
+                  if re.search(r'[А-Яа-яЁё]', m.group(0)) else m.group(0), text)
+
+
+def _fix_mojibake(text: str) -> str:
+    """
+    «╨Я╤А╨╛╤В╨╛╨║╨╛╨╗» -> «Протокол»: имя файла в UTF-8, распакованное из ZIP в кодировке DOS (CP866/CP437).
+    """
+    if text and re.search(r'[╨╤]', text):
+        for codepage in ('cp866', 'cp437'):
+            try:
+                return text.encode(codepage).decode('utf-8')
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                continue
+    return text
+
+
+def _norm(text: str) -> str:
+    text = unicodedata.normalize('NFC', _fix_mojibake(text or ''))
+    return re.sub(r'[_]+', ' ', text)
+
+
+def _title_if_upper(snippet: str) -> str:
+    """«ОСПАНОВ КАНАТ КАЙРАТОВИЧ» -> «Оспанов Канат Кайратович» (ФИО в бланках часто прописными)."""
+    return re.sub(r'(?<![А-ЯЁа-яёӘәҒғҚқҢңӨөҰұҮүҺһІі])[А-ЯЁӘҒҚҢӨҰҮҺІ]{3,}(?![А-ЯЁа-яёӘәҒғҚқҢңӨөҰұҮүҺһІі])',
+                  lambda m: m.group(0).capitalize(), snippet)
+
+
+def _persons_in(snippet: str) -> List[Dict]:
+    return find_person_mentions(normalize_text(_title_if_upper(snippet)))
+
+
+def _role_of(text_lower: str) -> str:
+    for label, pat in _ROLES:
+        if re.search(pat, text_lower):
+            return label
+    return ''
+
+
+def _action_role(text_lower: str, mentions: List[Dict]) -> str:
+    """
+    Статус допрашиваемого в пункте плана — по тексту ДО его ФИО или сразу после («Допросить свидетеля
+    Кубжасарову С.Д.», «Допросить Кубжасарова Р.Ж. в качестве подозреваемого»). Слова «подозреваемым»
+    в предмете допроса («…о родственных отношениях с подозреваемым») статус не определяют.
+    """
+    if not mentions:
+        return _role_of(text_lower)
+    first = mentions[0]
+    before = text_lower[:first['start']]
+    after = text_lower[first['end']:first['end'] + 60]
+    m = re.match(r'[\s,]*в\s+качестве\s+(.+)', after)
+    return _role_of(before) or (_role_of(m.group(1)) if m else '')
+
+
+def _expertise_kind(text_lower: str) -> str:
+    # «Департамент экономических расследований» — название органа, а не вид экспертизы
+    text_lower = re.sub(r'эконом\w*\s+расследовани\w*', ' ', text_lower or '')
+    for label, pat in _EXPERTISE_KINDS:
+        if re.search(pat, text_lower):
+            return label
+    return ''
+
+
+def _organs(text_lower: str) -> List[str]:
+    return [key for key, pat in _ORGANS if re.search(pat, text_lower)]
+
+
+def _quoted_names(text: str) -> List[str]:
+    """Названия организаций в кавычках: «Express Gold» -> express gold. Поля бланка («_09_», «15») — не названия."""
+    names = [q.strip().lower() for q in re.findall(r'[«"]([^»"]{2,60})[»"]', text or '')]
+    return [n for n in names if re.search(r'[a-zа-яәғқңөұүһі]{3,}', n)]
+
+
+_MONTHS = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа',
+           'сентября', 'октября', 'ноября', 'декабря']
+
+
+def _org_tokens(name: str) -> set:
+    """«Ясли-сад №27 г.Павлодара» и «Ясли-сад № 27 города Павлодара» -> {'ясли', 'сад', '27', 'павло'}."""
+    name = name.lower().replace('ё', 'е')
+    words = {w[:5] for w in re.findall(r'[a-zа-яәғқңөұүһі]{3,}', name)}
+    stop = {'город', 'облас', 'район', 'ленин'}
+    return (words - stop) | set(re.findall(r'\d+', name))
+
+
+def _orgs_overlap(a, b) -> bool:
+    """Одна и та же организация, записанная по-разному (сокращения, пробелы, «г.» / «города»)."""
+    for x in a or []:
+        tx = _org_tokens(x)
+        for y in b or []:
+            ty = _org_tokens(y)
+            common = tx & ty
+            digits_x, digits_y = {t for t in tx if t.isdigit()}, {t for t in ty if t.isdigit()}
+            if digits_x and digits_y and not (digits_x & digits_y):
+                continue  # «Ясли-сад №27» и «Ясли-сад №12» — разные организации
+            if len(common) >= 2 or (common and (common == tx or common == ty)):
+                return True
+    return False
+
+
+def _doc_date(text: str) -> str:
+    """
+    Дата составления — первая дата в шапке документа («14 мая 2024 года» или «14.05.2024»).
+    Дата регистрации ЕРДР в тексте постановления идёт позже и не берётся.
+    """
+    # День, вписанный в поле бланка: «_15_».05.2024, «_15_» мая 2024, «15» мая 2024
+    head = re.sub(r'«\s*_*\s*(\d{1,2})\s*_*\s*»', lambda m: f"{int(m.group(1)):02d}", text[:2500])
+    head = re.sub(r'\b(\d{2})\s+\.(\d{2})', r'\1.\2', head)
+    candidates = []  # (позиция, дата, год)
+    for m in re.finditer(r'\b(\d{2})[./](\d{2})[./](\d{4})(?!\d)', head):  # и «04.11.2025г.»
+        candidates.append((m.start(), m.end(), f"{m.group(1)}.{m.group(2)}.{m.group(3)}", int(m.group(3))))
+    for m in re.finditer(r'«?(\d{1,2})»?\s+(' + '|'.join(_MONTHS) + r')\s+(\d{4})', head, re.IGNORECASE):
+        candidates.append((m.start(), m.end(),
+                           f"{int(m.group(1)):02d}.{_MONTHS.index(m.group(2).lower()) + 1:02d}.{m.group(3)}",
+                           int(m.group(3))))
+    if not candidates:
+        return ''
+
+    def _is_other_date(start: int, end: int) -> bool:
+        """Дата рождения, регистрации ЕРДР/КУИ, выдачи удостоверения/лицензии — не дата документа."""
+        before = head[max(0, start - 90):start].lower()
+        after = head[end:end + 20].lower()
+        return bool(re.search(r'г\.\s?р|года?\s+рожд|рожд', after + ' ' + before[-25:])
+                    or re.search(r'ердр|куи|зарегистр|удостоверени|лиценз|свидетельств|выдан|аттестат|стаж', before))
+
+    # Даты за пределами «кластера» дела (например, 2005 год рядом с 2024-м) — не дата документа
+    own = [c for c in sorted(candidates) if not _is_other_date(c[0], c[1])]
+    if not own:
+        # В документе только даты рождения / регистрации / выдачи (запрос без даты в шапке) — даты документа нет
+        return ''
+    latest_year = max(c[3] for c in own)
+    plausible = [c for c in own if c[3] >= latest_year - 1]
+    return plausible[0][2]
+
+
+def _doc_title(filename: str) -> str:
+    title = _norm(filename)
+    title = re.sub(r'\.(pdf|docx?|txt|xlsx)$', '', title, flags=re.IGNORECASE)
+    title = re.sub(r'^\s*\d+\s*[.)]\s*', '', title)  # «13. Протокол…» -> «Протокол…»
+    title = re.sub(r'(?i)\bпртокол', 'Протокол', title)  # частая опечатка в названиях файлов
+    title = title[:1].upper() + title[1:]
+    return re.sub(r'\s+', ' ', title).strip(' .')
+
+
+# Название файла, по которому видно, что это за документ («Протокол (доп) допроса…»), а не «Некорректный файл»
+_DOC_WORD = re.compile(r'пр\w{0,2}токол|постановлени|заключени|экспертиз|допрос|обыск|выемк|осмотр|ответ|запрос|'
+                       r'рапорт|\bакт\b|справк|выписк|сведени|уведомлени|хаттам|қаулы|қорытынды', re.IGNORECASE)
+
+
+def _own_section(text: str, doc_type: str) -> str:
+    """
+    Файл-пакет («12. Заключение аудита»: сопроводительное письмо, опись, рапорт КУИ от 28.04, затем само
+    заключение от 21.04) — дата и признаки документа берутся из его раздела: от строки-заголовка
+    («Заключение государственного аудитора…»), за которой идёт дата.
+    """
+    pat = re.compile(dict(_DOC_TYPES)[doc_type], re.MULTILINE | re.IGNORECASE)
+    if pat.search(text[:300]):
+        return text
+    for m in pat.finditer(text):
+        line = text.rfind('\n', 0, m.start()) + 1
+        if not text[line:m.start()].strip() and _doc_date(text[line:line + 400]):
+            return text[line:]
+    return text
+
+
+def _target_persons(head: str, filename: str, official_keys: set) -> List[Dict]:
+    """ФИО лица, с которым проведено действие: из имени файла, затем по меткам бланка, затем первое не-должностное."""
+    for source in (_norm(filename), head):
+        for label, max_offset in _PERSON_LABELS:
+            for m in re.finditer(label, source, re.IGNORECASE):
+                found = [p for p in _persons_in(source[m.end():m.end() + max_offset + 90])
+                         if p['start'] <= max_offset and p['key'] not in official_keys]
+                if found:
+                    return found[:1]
+    # Без метки берём ФИО только из названия файла: первое ФИО в тексте — обычно подозреваемый
+    # из фабулы («в отношении бухгалтера Кубжасарова Р.Ж.»), а не лицо, с которым проведено действие
+    persons = [p for p in _persons_in(_norm(filename)) if p['key'] not in official_keys]
+    return persons[:1] or _blank_field_person(head, filename, official_keys)
+
+
+_LETTERS = 'А-ЯЁа-яёӘәҒғҚқҢңӨөҰұҮүҺһІі'
+# «Фамилия, имя, отчество: Оралбекқызы Камила» / «Тегі, аты, әкесінің аты: …»
+_FIO_FIELD = re.compile(r'(?:Фамилия,?\s*имя,?\s*отчество|Тегі,?\s*аты,?\s*әкесінің\s+аты)[^:\n]{0,25}:\s*([^\n]{3,80})',
+                        re.IGNORECASE)
+# «протокол_допроса_свидетеля_Оралбеккызы_Камила.pdf», «…_свидетеля_Акбар_А._.pdf»
+_FIO_IN_NAME = re.compile(rf'(?:свидет|потерпевш|подозреваем|специалист|эксперт)\w*[\s_]+'
+                          rf'([{_LETTERS}]{{2,}}(?:[\s_]+[{_LETTERS}]{{1,}}\.?){{1,2}})', re.IGNORECASE)
+
+
+def _blank_field_person(head: str, filename: str, official_keys: set) -> List[Dict]:
+    """
+    Казахские ФИО из двух частей («Оралбекқызы Камила», «Акбар А.») обычный поиск ФИО (фамилия + имя + отчество
+    или инициалы) не находит. Тогда ФИО берётся из поля бланка протокола, а если OCR его не прочитал — из имени файла.
+    """
+    from core.case_participants import _person_key
+    name = re.sub(r'\.(?:pdf|docx?|txt|xlsx)$', '', _norm(filename), flags=re.IGNORECASE)
+    for source, pat in ((head, _FIO_FIELD), (name, _FIO_IN_NAME)):
+        m = pat.search(source or '')
+        if not m:
+            continue
+        words = re.findall(rf'[{_LETTERS}]+\.?', _title_if_upper(m.group(1)))
+        words = [w for w in words if w[0].isupper()][:3]
+        if len(words) < 2 or len(words[0]) < 3:
+            continue
+        key = _person_key(words[0], words[1][0])
+        if key in official_keys:
+            continue
+        fio = ' '.join(words) if len(words[1]) > 2 else f"{words[0]} {words[1][0]}."
+        return [{'fio': fio, 'key': key, 'start': 0, 'end': 0}]
+    return []
+
+
+_DECISION_PART = re.compile(r'П\s*О\s*С\s*Т\s*А\s*Н\s*О\s*В\s*И\s*Л|ҚАУЛЫ\s+ЕТТІМ|ПОСТАНОВЛЯЮ')
+
+
+_FORM_WORD = r'[А-ЯЁӘҒҚҢӨҰҮҺІ][а-яёәғқңөұүһі]+(?:-[А-ЯЁ][а-яё]+)?'
+
+
+def _form_person(text: str) -> List[Dict]:
+    """
+    Бланк с полями «5. ФАМИЛИЯ 5.1 Альхимович 6. ИМЯ … 6.1 Валерий 7: Евгеньевич» (постановление о
+    межгосударственном розыске, карточки учёта) — ФИО собирается из полей.
+    """
+    from core.case_participants import _person_key
+    sm = re.search(rf'ФАМИЛИЯ[^А-ЯЁа-яё]{{0,25}}({_FORM_WORD})', text or '')
+    if not sm:
+        return []
+    nm = re.search(rf'\bИМЯ\b[\s\S]{{0,80}}?({_FORM_WORD})', text[sm.end():sm.end() + 300])
+    if not nm:
+        return []
+    rest = text[sm.end() + nm.end(): sm.end() + nm.end() + 60]
+    pm = re.search(rf'({_FORM_WORD})', rest)
+    surname, first = sm.group(1), nm.group(1)
+    patronymic = pm.group(1) if pm and re.search(r'(?:вич|вна|чна|улы|ұлы|кызы|қызы)$', pm.group(1)) else ''
+    fio = ' '.join(x for x in (surname, first, patronymic) if x)
+    return [{'fio': fio, 'key': _person_key(surname, first[0]), 'start': 0, 'end': 0}]
+
+
+def _decision_persons(text: str, official_keys: set) -> List[Dict]:
+    """
+    Лицо, о котором вынесено решение: из полей бланка («ФАМИЛИЯ … ИМЯ …»), иначе первое ФИО в резолютивной
+    части («ПОСТАНОВИЛ: 1. Объявить в розыск …»), иначе в начале документа.
+    """
+    form = [p for p in _form_person(text) if p['key'] not in official_keys]
+    if form:
+        return form
+    m = _DECISION_PART.search(text or '')
+    for part in ((text[m.end():m.end() + 1500],) if m else ()) + ((text or '')[:4000],):
+        found = [p for p in _persons_in(part) if p['key'] not in official_keys]
+        if found:
+            return found[:1]
+    return []
+
+
+_REFUSAL = re.compile(
+    r'(?<!не\s)от\s+дачи\s+показаний\s+(?:отказываюсь|отказывается|отказался|отказалась|отказ\b)'
+    r'|(?<!не\s)отказал(?:ся|ась)\s+от\s+дачи\s+показаний'
+    r'|воспользовал\w*\s+(?:правом|ст\.?\s*77)[^.\n]{0,60}Конституци'
+    r'|айғақ\s+беруден\s+бас\s+тарт(?:амын|ты)', re.IGNORECASE)
+
+# Документы, которые без указания лица не имеют смысла (кого признали потерпевшим, кого допросили)
+_PERSON_REQUIRED = {'потерпевший', 'подозреваемый', 'допрос', 'очная_ставка', 'мера_пресечения'}
+# Незаполненное поле лица в бланке: «1.   ж.т. осы қылмыстық іс бойынша жәбірленуші деп тануды»,
+# «1. Признать   г.р. потерпевшим» (нет ни ФИО, ни года рождения), «Фамилия, имя, отчество: ______⏎Дата рождения:»
+# (подчёркивания после _norm — пробелы). Значение на следующей строке («отчество:⏎Оралбекқызы Камила») — не пустое
+# поле: пустым считается, только если сразу за ним идёт следующее поле бланка
+_BLANK_PERSON = re.compile(
+    r'(?:^|[\n:;]|\b\d{1,2}\.)[ \t]*(?:признать[ \t]+)?(?:г\.[ \t]?р\.|ж\.[ \t]?т\.)'
+    r'|(?:Фамилия,?\s*имя,?\s*отчество|Тегі,?\s*аты,?\s*әкесінің\s+аты)[^:\n]{0,25}:[ \t_]*\n[ \t]*[^\n:]{2,40}:',
+    re.IGNORECASE | re.MULTILINE)
+
+
+def detect_conducted_actions(documents: List[Dict], officials: Optional[List[Dict]] = None) -> List[Dict]:
+    """
+    Возвращает список проведённых действий (JSON-сериализуемый, хранится в case_data):
+    [{тип, роль, лица: [ключи], фио: [ФИО], вид_экспертизы, органы, организации, дата, документ, файл}]
+    """
+    official_keys = {o['key'] for o in (officials or [])
+                     if o.get('role') in ('сотрудник органа', 'руководство органа', 'прокурор', 'судья')}
+    result = []
+    for doc in documents or []:
+        filename = doc.get('filename', '') or ''
+        text = _fix_homoglyphs(_norm(doc.get('text', '') or ''))
+        original_filename = filename
+        filename = _fix_homoglyphs(_norm(filename))
+        # Резолютивная часть постановлений («ПОСТАНОВИЛ: Произвести выемку у …») идёт после 2–3 тыс. символов
+        head = text[:6000]
+        # Тип — по названию файла; по тексту только если название неинформативно
+        # (в тексте постановления о назначении экспертизы встречается «заключение эксперта» и т.п.)
+        name_probe = _norm(filename).lower()
+        text_probe = text[:600].lower()
+        name_type = next((t for t, pat in _DOC_TYPES if re.search(pat, name_probe)), None)
+        doc_type = name_type \
+            or next((t for t, pat in _DOC_TYPES if t not in _NAME_ONLY_TYPES and re.search(pat, text_probe)), None)
+        if not doc_type:
+            continue
+        own = _own_section(text, doc_type)
+        text_probe = own[:600].lower()
+        probe = name_probe + ' \n ' + text_probe
+        title = _doc_title(filename)
+
+        item = {
+            'тип': doc_type,
+            'роль': '',
+            'лица': [],
+            'фио': [],
+            'вид_экспертизы': '',
+            'органы': [],
+            'организации': _quoted_names(filename + ' ' + head[:3000]),
+            'дата': _doc_date(own),
+            # «19. Некорректный_файл.pdf» о документе ничего не говорит — в пункт плана идёт только вид действия
+            'документ': title if name_type or _DOC_WORD.search(title) else '',
+            'файл': original_filename,
+        }
+        if doc_type in ('допрос', 'очная_ставка', 'обыск', 'выемка', 'арест', 'потерпевший', 'санкция'):
+            if doc_type == 'допрос':
+                # Роль — из названия протокола или «допросил в качестве …», а не из любого упоминания в тексте
+                in_role = re.search(r'в\s+качестве\s+([^:\n]{3,60})', head, re.IGNORECASE)
+                item['роль'] = _role_of(name_probe) or (_role_of(in_role.group(1).lower()) if in_role else '') \
+                    or _role_of(text_probe)
+                # «От дачи показаний отказываюсь» (в бланке стоит и «…не отказываюсь» — это не отказ)
+                item['отказ'] = bool(_REFUSAL.search(text))
+            if doc_type == 'очная_ставка':
+                m = re.search(r'между\s+', head, re.IGNORECASE)
+                persons = [p for p in _persons_in(head[m.end():m.end() + 200] if m else head)
+                           if p['key'] not in official_keys][:2]
+            else:
+                persons = _target_persons(head, filename, official_keys)
+            item['лица'] = [p['key'] for p in persons]
+            item['фио'] = [re.sub(r'\s+', ' ', p['fio']).strip() for p in persons]
+        if doc_type in ('подозреваемый', 'квалификация', 'мера_пресечения', 'розыск', 'защитник',
+                        'сио_псо', 'установление'):
+            # Лицо — из названия файла («…СИОПСО__Альхимович_В.Е.») или из резолютивной части постановления
+            persons = [p for p in _persons_in(_norm(filename)) if p['key'] not in official_keys][:1] \
+                or _decision_persons(text, official_keys)
+            item['лица'] = [p['key'] for p in persons]
+            item['фио'] = [re.sub(r'\s+', ' ', p['fio']).strip() for p in persons]
+        # Бланк с незаполненным лицом — документ не составлен (проект или ошибочный файл), действие не проведено.
+        # Потерпевший-организация («признать потерпевшим ГУ «…»») — без такого пустого поля и учитывается
+        if doc_type in _PERSON_REQUIRED and not item['лица'] and _BLANK_PERSON.search(own[:6000]):
+            print(f"  ⚠ [Проведено] «{original_filename}»: в документе не указано лицо (поле ФИО не заполнено) — "
+                  f"не считается исполненным")
+            continue
+        if doc_type in ('заключение', 'назначение_экспертизы'):
+            # Вид — по названию файла, иначе по началу текста
+            item['вид_экспертизы'] = _expertise_kind(name_probe) or _expertise_kind(text_probe)
+        if doc_type == 'заключение':
+            # Заключение специалиста (исследование) — не экспертиза: не закрывает «Назначить … экспертизу»
+            # «Заключение государственного аудитора, привлеченного … в качестве специалиста» (ДВГА) — тоже специалист
+            item['специалист'] = bool(re.search(r'специал', name_probe)
+                                      or re.search(r'заключени\w*\s+(?:специал|[^.\n]{0,80}?привлеч\w*[^.\n]{0,60}?'
+                                                   r'в\s+качестве\s+специал)', text_probe))
+        if doc_type in ('заключение', 'назначение_экспертизы'):
+            item['дополнительная'] = bool(re.search(r'дополнительн|повторн', probe))
+        if doc_type in ('ответ', 'запрос'):
+            # Адресат — по названию файла («ответ_с_Комитета…», «запрос_АО_«Сәтті_Жұлдыз»»); в шапке текста
+            # стоят реквизиты самого органа расследования, по ним адресат не определить
+            item['органы'] = _organs(name_probe) or _organs(text_probe)
+        if doc_type == 'санкция':
+            item['роль'] = 'обыска' if re.search(r'обыск', probe) else 'выемки'
+        result.append(item)
+
+    if result:
+        print(f"  📑 Проведённые действия по материалам дела: {len(result)}")
+        for c in result:
+            who = ', '.join(c['фио']) or c['вид_экспертизы'] or ', '.join(c['органы'])
+            print(f"     • {c['тип']}{(' ' + c['роль']) if c['роль'] else ''}{(' — ' + who) if who else ''}"
+                  f"{' [ОТКАЗ от дачи показаний]' if c.get('отказ') else ''} ({c['документ'] or c['файл']})")
+    return result
+
+
+def refused_persons(conducted: List[Dict]) -> Dict[str, str]:
+    """
+    Лица, отказавшиеся от дачи показаний, — {ключ: ФИО}. Если то же лицо допрошено и без отказа
+    (дал показания на другом допросе), отказ не учитывается.
+    """
+    refused, testified = {}, set()
+    for c in conducted or []:
+        if c.get('тип') != 'допрос':
+            continue
+        for key, fio in zip(c.get('лица') or [], c.get('фио') or []):
+            if c.get('отказ'):
+                refused.setdefault(key, fio)
+            else:
+                testified.add(key)
+    return {k: v for k, v in refused.items() if k not in testified}
+
+
+def _action_type(text_lower: str) -> Optional[str]:
+    """Тип пункта плана в терминах _DOC_TYPES."""
+    t = text_lower.strip()
+    if re.search(r'очн\w*\s+ставк', t):
+        return 'очная_ставка'
+    if re.match(r'\s*(?:допросить|провести\s+(?:дополнительн\w+\s+)?допрос|допрос)', t):
+        return 'допрос'
+    if re.search(r'признан\w*\s+(?:в\s+качестве\s+)?вещественн|вещественн\w+\s+доказательств', t):
+        return 'вещдок'
+    if re.search(r'назнач\w*[\w\s-]*экспертиз', t):
+        return 'назначение_экспертизы'
+    if re.search(r'признать[\w\s-]*потерпевш|признании[\w\s-]*потерпевш', t):
+        return 'потерпевший'
+    if re.search(r'(?:наложить|наложении)\s+(?:арест|ограничени)|арест\w*\s+(?:на\s+)?имуществ', t):
+        return 'арест'
+    if re.match(r'\s*(?:произвести|провести)?\s*осмотр', t):
+        return 'осмотр'
+    if re.search(r'мер\w*\s+пресечени', t):
+        return 'мера_пресечения'
+    if re.search(r'розыск', t):
+        return 'розыск'
+    # [^;] а не [^.;]: «Признать Альхимовича В.Е. подозреваемым» — точки в инициалах
+    if re.search(r'признат\w*[^;]{0,80}?подозреваем|признании[^;]{0,40}?подозреваем', t):
+        return 'подозреваемый'
+    if re.search(r'квалификаци\w*\s+деяни|о\s+квалификации', t):
+        return 'квалификация'
+    if re.search(r'назнач\w*\s+защитник', t):
+        return 'защитник'
+    if re.search(r'установ\w*\s+(?:места|местонахожд|фактическ\w+\s+местонахожд|полн\w+\s+анкетн)', t):
+        return 'установление'
+    # Проверка по базе СИО ПСО — не запрос, не анализ выписок («…выписки, полученные через БД СИО ПСО / из БВУ»)
+    if re.search(r'сио\s*п\w*\s*со|сиопсо', t) and not re.search(r'запрос|истребова|выпис|банк|движени\w*\s+денеж|анализ', t):
+        return 'сио_псо'
+    if re.search(r'выемк|обыск', t):
+        if re.search(r'санкционир|ходатайств|постановлени', t):
+            return 'санкция'
+        if re.match(r'\s*(?:произвести|провести|осуществить)?\s*(?:выемк|обыск)', t):
+            return 'обыск' if 'обыск' in t else 'выемка'
+    if re.search(r'направить\s+запрос|истребовать\s+сведени|запросить', t):
+        return 'ответ'
+    return None
+
+
+def match_conducted(action_text: str, conducted: List[Dict]) -> Optional[Dict]:
+    """
+    Находит проведённое действие, соответствующее пункту плана.
+    Совпадение засчитывается только по конкретному лицу / организации / виду экспертизы / адресату запроса.
+    Общие пункты без конкретики («Произвести осмотр изъятых документов») не отмечаются исполненными.
+    """
+    if not action_text or not conducted:
+        return None
+    t = _norm(action_text).lower()
+    a_type = _action_type(t)
+    if not a_type:
+        return None
+
+    mentions = find_person_mentions(normalize_text(_norm(action_text)))
+    persons = {p['key'] for p in mentions}
+    if a_type == 'допрос' and mentions:
+        # Допрашиваемый — первое лицо в пункте. В «Допросить свидетеля Кубжасарову С.Д. о деньгах,
+        # полученных от Кубжасарова Р.Ж.» второе лицо — предмет показаний, а не допрашиваемый
+        persons = {mentions[0]['key']}
+    orgs = set(_quoted_names(action_text))
+    role = _action_role(t, mentions) if a_type == 'допрос' else ''
+
+    for c in conducted:
+        c_type = c.get('тип')
+        c_persons = set(c.get('лица') or [])
+        # Отказ от дачи показаний не закрывает допрос по существу: пункт плана остаётся открытым
+        if c.get('отказ') and a_type == 'допрос':
+            continue
+        if a_type == 'допрос' and c_type == 'допрос':
+            if persons and c_persons:
+                # Допрос того же лица; статус (свидетель → подозреваемый) должен совпадать
+                if persons & c_persons and (not role or not c.get('роль') or role == c.get('роль')):
+                    return c
+            elif not persons and role in ('эксперта', 'специалиста', 'представителя потерпевшего', 'потерпевшего') \
+                    and role == c.get('роль'):
+                return c
+        elif a_type == 'очная_ставка' and c_type == 'очная_ставка':
+            if len(persons & c_persons) >= 2 or (c_persons and c_persons <= persons):
+                return c
+        elif a_type in ('обыск', 'выемка', 'арест', 'потерпевший') and c_type == a_type:
+            if (persons & c_persons) or (_orgs_overlap(orgs, c.get('организации'))):
+                return c
+        elif a_type == 'санкция' and c_type == 'санкция':
+            same_kind = ('обыск' in t) == (c.get('роль') == 'обыска')
+            if same_kind and ((persons & c_persons) or (_orgs_overlap(orgs, c.get('организации')))):
+                return c
+        elif a_type == 'назначение_экспертизы' and c_type in ('назначение_экспертизы', 'заключение'):
+            if c.get('специалист'):
+                continue
+            # «Назначить дополнительную/повторную экспертизу» закрывает только такой же документ
+            if bool(re.search(r'дополнительн|повторн', t)) != bool(c.get('дополнительная')):
+                continue
+            kind = _expertise_kind(t)
+            if kind and kind == c.get('вид_экспертизы'):
+                return c
+        elif a_type in ('подозреваемый', 'квалификация', 'мера_пресечения', 'розыск', 'защитник', 'установление') \
+                and c_type == a_type:
+            # Решение по тому же лицу; если лицо в пункте не названо — по виду решения
+            if not persons or not c_persons or persons & c_persons:
+                return c
+        elif a_type == 'сио_псо' and c_type == 'сио_псо':
+            return c
+        elif a_type == 'ответ' and c_type in ('ответ', 'запрос'):
+            # «Направить запрос» закрывает и отправленный запрос, и ответ; «Истребовать сведения» — только ответ
+            if c_type == 'запрос' and re.match(r'\s*истребовать', t):
+                continue
+            a_organs = set(_organs(t))
+            if a_organs & set(c.get('органы') or []):
+                return c
+        elif a_type in ('осмотр', 'вещдок') and c_type == a_type:
+            if (persons & c_persons) or (_orgs_overlap(orgs, c.get('организации'))):
+                return c
+            # «Осмотр изъятых документов» / «вещдоки по изъятому» без конкретики: если в деле ровно один
+            # такой документ, это он (иначе исполненный пункт остаётся без даты, а документ дублируется)
+            same_type = [x for x in conducted if x.get('тип') == a_type]
+            if len(same_type) == 1 and re.search(r'изъят|выемк|обыск', t) \
+                    and not re.search(r'выпис|банк|полученн|запрос', t):
+                return c
+    return None
+
+
+def conducted_action_item(c: Dict, fio_investigator: str) -> Dict:
+    """Пункт плана для проведённого действия, которого не было среди сгенерированных."""
+    label = _TYPE_LABEL.get(c['тип'], 'Проведено')
+    details = ''
+    if c['тип'] == 'допрос':
+        details = f" {c['роль'] or 'лица'}" + (f": {', '.join(c['фио'])}" if c['фио'] else '')
+        if c.get('отказ'):
+            details += " (от дачи показаний отказался(-ась))"
+    elif c['тип'] == 'очная_ставка' and c['фио']:
+        details = f" между {' и '.join(c['фио'])}"
+    elif c['тип'] in ('обыск', 'выемка') and c['фио']:
+        details = f" у {', '.join(c['фио'])}"
+    elif c['тип'] == 'санкция':
+        details = f" {c['роль'] or 'выемки'}" + (f" ({', '.join(c['фио'])})" if c['фио'] else '')
+    elif c['тип'] in ('подозреваемый', 'квалификация', 'мера_пресечения', 'розыск', 'защитник',
+                      'сио_псо', 'установление') and c['фио']:
+        details = f" ({', '.join(c['фио'])})"
+    elif c['тип'] == 'заключение' and c.get('специалист'):
+        label = 'Получено заключение специалиста'
+        kind = re.sub(r'ая$', 'ое', c['вид_экспертизы']) if c['вид_экспертизы'] else ''
+        details = f" ({kind} исследование)" if kind else ''
+    elif c['тип'] in ('заключение', 'назначение_экспертизы') and c['вид_экспертизы']:
+        details = f" ({c['вид_экспертизы']} экспертиза)"
+    doc = c.get('документ') or ''
+    date = f" от {c['дата']}" if c.get('дата') else ''
+    return {
+        'действие': (f"{label}{details}" + (f" — {doc}" if doc else '') + date).strip(),
+        'цель': 'Действие проведено, результаты закреплены в материалах уголовного дела.',
+        'результат': f"{doc or label}{date}",
+        'исполнитель': fio_investigator,
+        'срок': c.get('дата') or '',
+        'статус': STATUS_DONE,
+        'основание_статуса': c.get('файл', ''),
+    }
+
+
+def apply_conducted_statuses(actions: List[Dict], conducted: List[Dict], fio_investigator: str,
+                             add_missing: bool = True) -> List[Dict]:
+    """
+    1. Пункты плана, совпавшие с проведёнными действиями, получают статус «Исполнен» и ссылку на документ.
+    2. Санкция перед исполненной выемкой/обыском и истребование после исполненного запроса — тоже исполнены.
+    3. Проведённые действия, которых в плане нет, добавляются отдельными пунктами со статусом «Исполнен».
+    """
+    if not conducted:
+        return actions
+    used = set()
+    for act in actions:
+        if act.get('статус_заблокирован'):
+            continue
+        c = match_conducted(act.get('действие', ''), conducted)
+        if c is not None:
+            act['статус'] = STATUS_DONE
+            act['основание_статуса'] = c.get('файл', '')
+            # Срок исполненного пункта — фактическая дата по документу. Если дату не прочитать (скан без OCR),
+            # срок не указываем: будущий срок, рассчитанный моделью, у исполненного пункта вводит в заблуждение
+            act['срок'] = c.get('дата') or ''
+            used.add(id(c))
+            print(f"  ✅ [Проведено] «{act.get('действие', '')[:70]}» — {c.get('документ')}")
+
+    # Связанные шаги процессуальной цепочки: выемка/обыск проведены → санкция на них получена;
+    # ответ на запрос получен → запрос направлен и сведения истребованы
+    def _ids(text):
+        return ({p['key'] for p in find_person_mentions(normalize_text(_norm(text)))}, set(_quoted_names(text)))
+
+    done = [a for a in actions if a.get('статус') == STATUS_DONE]
+    for act in done:
+        t = act.get('действие', '').lower()
+        a_type = _action_type(t)
+        persons, orgs = _ids(act.get('действие', ''))
+        organs = set(_organs(t))
+        for other in actions:
+            if other is act or other.get('статус') == STATUS_DONE or other.get('статус_заблокирован'):
+                continue
+            o_text = other.get('действие', '')
+            o_lower = o_text.lower()
+            linked = False
+            if a_type in ('обыск', 'выемка') and _action_type(o_lower) == 'санкция' \
+                    and ('обыск' in o_lower) == (a_type == 'обыск'):
+                o_persons, o_orgs = _ids(o_text)
+                linked = bool((persons & o_persons) or _orgs_overlap(orgs, o_orgs))
+            elif a_type == 'ответ' and _action_type(o_lower) == 'ответ' and organs:
+                linked = bool(organs & set(_organs(o_lower)))
+            if linked:
+                other['статус'] = STATUS_DONE
+                other['основание_статуса'] = act.get('основание_статуса', '')
+                other['срок'] = ''  # собственного документа нет — точная дата неизвестна
+
+    if add_missing:
+        missing = [c for c in conducted if id(c) not in used]
+        for c in missing:
+            actions.append(conducted_action_item(c, fio_investigator))
+        if missing:
+            print(f"  ➕ [Проведено] Добавлено в план проведённых действий: {len(missing)}")
+    return actions
+
+
+def conducted_prompt_block(conducted: List[Dict], limit: int = 40) -> str:
+    """Список проведённых действий для промпта LLM."""
+    if not conducted:
+        return ''
+    lines = []
+    for c in conducted[:limit]:
+        item = conducted_action_item(c, '')
+        lines.append(f"  - {item['действие']}")
+    return "\n".join(lines)
