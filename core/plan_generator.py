@@ -144,8 +144,8 @@ def detect_gender_in_names(fio) -> str:
                 # Окончания -ова, -ева, -ина:
                 if ln_lower.endswith(('ова', 'ева', 'ина', 'ая', 'яя', 'ская')):
                     # Если после фамилии идут ИНИЦИАЛЫ (напр. Р.Ж. или А.Б.) и нет женского отчества/имени,
-                    # то в юридическом тексте «в отношении Кубжасарова Р.Ж.» это МУЖСКОЙ родительный падеж!
-                    # (Для женщины в родительном падеже писалось бы «Кубжасаровой Р.Ж.»)
+                    # то в юридическом тексте «в отношении Макарова Р.Ж.» это МУЖСКОЙ родительный падеж!
+                    # (Для женщины в родительном падеже писалось бы «Макаровой Р.Ж.»)
                     rest_str = " ".join(words[1:]) if len(words) > 1 else ""
                     if rest_str and re.match(r'^[А-ЯЁ]\.[А-ЯЁ]\.?$', rest_str):
                         gender = 'мужской'
@@ -279,7 +279,7 @@ def _restore_case(formatted: str, source: str) -> str:
             not re.search(r'(?:\b(?:г|гг|ул|пр|просп|обл|р|с|п|пос|им|мкр|д|кв)|\b[А-ЯЁ])\.\s*$', before, re.IGNORECASE)
         # «Р.Ж.» — инициалы (буква с точкой), а не начало предложения после точки; «В период» — не инициал
         is_initial = len(word) == 1 and source[m.end():m.end() + 1] == '.'
-        # «Толегенова Э.Д. …» в начале предложения — фамилия (за ней инициалы), а не просто заглавная буква
+        # «Николаева Э.Д. …» в начале предложения — фамилия (за ней инициалы), а не просто заглавная буква
         before_initials = re.match(r'\s+[А-ЯЁӘҒҚҢӨҰҮҺІ]\.', source[m.end():m.end() + 4]) is not None
         # одна буква сохраняет заглавную только как инициал («Р А П О Р Т» — разрядка, а не имя)
         if word != word.lower() and (is_initial or (len(word) > 1 and (
@@ -383,8 +383,10 @@ def _clean_action_texts(action: dict, case_data: dict) -> None:
     # ── Убираем автонумерацию LLM (5.3.1., 1), 2. и т.п.) из начала текста ──
     action['действие'] = re.sub(r'^\s*\d+(?:\.\d+)*\.?\s*[).]?\s*', '', action['действие']).strip()
     # ── «Проверка показаний посредством очной ставки» — это очная ставка между участниками ──
-    from core.procedural_validator import fix_confrontation_wording
+    from core.procedural_validator import fix_confrontation_wording, fix_suspect_gender
     action['действие'] = fix_confrontation_wording(action['действие'])
+    # «подозреваемого Петрову» — род по полу лица из материалов дела
+    action['действие'] = fix_suspect_gender(action['действие'], case_data)
     action['цель'] = re.sub(r'^\s*\d+(?:\.\d+)*\.?\s*[).]?\s*', '', action['цель']).strip()
     # ── Запросы и поручения самому органу (АФМ/ДЭР) — только внешние запросы; пункт удаляется ──
     if action.get('статус') != 'Исполнен' and _is_self_request(action.get('действие', '')):
@@ -495,8 +497,8 @@ def _refuser_in(text: str, refused: dict):
         return None
     norm = normalize_text(text)
     if re.search(r'очн\w*\s+ставк', norm, re.IGNORECASE):
-        # Участники — только до предмета ставки: «между Кымбатовой С.А. и Оралбекқызы К. по вопросу роли
-        # Жанабылова Е.Н.» — Жанабылов не участник (а «Оралбекқызы К.» с одним инициалом как ФИО не распознаётся)
+        # Участники — только до предмета ставки: «между Зайцевой С.А. и Серікқызы К. по вопросу роли
+        # Бекова Е.Н.» — Беков не участник (а «Серікқызы К.» с одним инициалом как ФИО не распознаётся)
         m = re.search(r'между\s+|ставк\w*\s+', norm, re.IGNORECASE)
         part = norm[m.end():] if m else norm
         end = re.search(r'\s(?:по|о|об|на\s+предмет|с\s+целью|в\s+целях|в\s+части|относительно|касательно|для|'
@@ -523,11 +525,13 @@ def _filter_by_status(actions: list, case_data: dict, corpus: str, conducted: li
         is_forbidden_attorney_action,
         is_forbidden_search_of_witness_or_victim,
     )
-    from core.procedural_validator import is_answer_as_material_evidence
+    from core.procedural_validator import is_answer_as_material_evidence, address_in_materials, _chain_step
     from core.case_participants import set_case_persons, case_person_keys
+    # Адреса — из материалов дела (corpus — тексты всех документов дела и найденные в них адреса фигурантов)
+    address_corpus = corpus or ''
     conducted = conducted if conducted is not None else case_data.get('проведённые_действия')
     participants = (case_data.get('должностные_лица') or []) + (case_data.get('иные_участники') or [])
-    # Лица этого дела — по ним в пунктах плана распознаются и ФИО с одним инициалом («Оралбекқызы К.»)
+    # Лица этого дела — по ним в пунктах плана распознаются и ФИО с одним инициалом («Серікқызы К.»)
     # (действует и для дальнейшей проверки: цепочки, сроки, дубли запросов)
     set_case_persons(case_person_keys(corpus, participants, conducted, case_data.get('фигуранты', '')))
     refused = refused_persons(conducted)
@@ -553,6 +557,11 @@ def _filter_by_status(actions: list, case_data: dict, corpus: str, conducted: li
                 print(f"  ✂ [Фильтр] {refuser} отказался(-ась) от дачи показаний — очная ставка и проверка "
                       f"показаний с ним не проводятся: '{text[:70]}...'")
                 continue
+            # Санкция, обыск, выемка по адресу, которого нет в материалах дела, — выдуманный адрес (автор, 06.11.2026)
+            if _chain_step(text.lower()) in ('санкция', 'обыск', 'выемка') \
+                    and not address_in_materials(text, address_corpus):
+                print(f"  ✂ [Адрес] Адреса нет в материалах дела — пункт удалён: '{text[:110]}...'")
+                continue
         result.append(action)
     return filter_actions_by_participants(result, corpus, participants)
 
@@ -563,6 +572,15 @@ _STAGE_CHECKS = [
     (r'арест', r'наложени\w*\s+арест|арест\w*\s+(?:на\s+)?(?:имуществ|денежн|сч[её]т|дол)|о\s+наложении\s+арест'),
     # ст.214: отсутствие регистрации/лицензии — ключевой элемент состава
     (r'лиценз', r'лиценз'),
+    # ст.216: цифровой след ЭСФ (до общего «цифровой след»), регистрация и ЭЦП, фактическое исполнение
+    (r'\bэсф\b|сч[её]т\w*-фактур',
+     r'ис\s*эсф|журнал\w*[^.;]{0,40}(?:эсф|сч[её]т)|(?:запрос|истребова)\w*[^.;]{0,80}(?:\bэсф\b|сч[её]т\w*-фактур)'),
+    (r'регистрацион\w*\s+данн|полномочи',
+     r'правительство\s+для\s+граждан|регистрацион\w*\s+дел|госкорпорац|\bцон\b|\bнуц\b|'
+     r'удостоверяющ\w*\s+центр|доверенност'),
+    (r'фактическ\w*\s+исполнен',
+     r'фактическ\w*\s+(?:выполнен|исполнен|отгруз|поставк|оказан|наличи)|реальност|'
+     r'осмотр\w*[^.;]{0,60}(?:объект|склад|помещен)|перевозчик|субподряд|товарно-транспорт|\bттн\b'),
     # ст.190: общая часть и виды (строительство, субсидии, массовое, интернет)
     (r'основани\w*\s+передачи', r'договор|заявк|решени\w*\s+о\s+выплат|основани\w*\s+(?:передачи|выплаты)'),
     (r'реальност', r'осмотр\w*[^.;]{0,60}объект|реальност|поставщик|подрядчик|контрагент'),
@@ -649,13 +667,88 @@ def _stage_limits(retrieved_context: str) -> dict:
     return limits
 
 
+def _relative_stage_limits(retrieved_context: str) -> dict:
+    """
+    «Этап 16. Наложение ареста на имущество (срок: до 10 суток после ограничения)» -> {16: 10}: срок этапа методики,
+    отсчитываемый от предыдущего шага цепочки пункта (арест — от ограничения того же лица). У пункта без предыдущего
+    шага («до 5 суток после выявления имущества» — выявление отдельным пунктом не задано) такой срок не действует.
+    """
+    text = retrieved_context or ''
+    start = text.find('=== МЕТОДИКА')
+    end = text.find('=== ДАННЫЕ ИЗ МАТЕРИАЛОВ ДЕЛА')
+    text = text[start if start >= 0 else 0: end if end > 0 else len(text)]
+    limits = {}
+    for m in re.finditer(r'(?im)^[ \t]*этап\s+(\d+)[^\n]*?\(срок:\s*до\s+(\d+)\s+(?:сут|дн)[^)\n]*\)', text):
+        if re.search(r'после', m.group(0), re.IGNORECASE):
+            limits.setdefault(int(m.group(1)), int(m.group(2)))
+    return limits
+
+
+def _inspection_stage(retrieved_context: str):
+    """
+    Номер этапа «Осмотры» методики дела: «Этап 11. Осмотры (срок: до 30 суток) — Осмотр изъятого и полученных
+    сведений» (216, 190, 214), «ЭТАП 17: ОСМОТР» (общая, 218, 307). Сначала — этап осмотра, где сказано о полученных
+    сведениях; иначе — этап с названием просто «Осмотр(ы)». Осмотры по виду («Осмотр объекта строительства») — нет.
+    """
+    cands = []
+    for title, body in _methodology_stages(retrieved_context):
+        m = re.match(r'Этап\s+(\d+)\.\s*(.*)', title)
+        if m and re.match(r'\s*осмотр', m.group(2), re.IGNORECASE):
+            cands.append((int(m.group(1)), m.group(2).strip().lower(), body.lower()))
+    for n, _name, body in cands:
+        if 'полученн' in body:
+            return n
+    for n, name, _body in cands:
+        if re.fullmatch(r'осмотр\w*', name):
+            return n
+    return None
+
+
+def _suspect_interview_stage(retrieved_context: str):
+    """
+    Номер этапа допросов подозреваемых методики дела: «Допросы подозреваемых» (190, 216 — 17), «ДОПРОС ФИГУРАНТОВ»
+    (217 — 18); если такого нет — общий этап «Допросы» (189 — 5, 214 — 9, 218/307/общая — 10). Этапы допросов
+    свидетелей, потерпевших, участников и дополнительных допросов не подходят.
+    """
+    general = None
+    for title, _body in _methodology_stages(retrieved_context):
+        m = re.match(r'Этап\s+(\d+)\.\s*(.*)', title)
+        if not m:
+            continue
+        name = m.group(2).strip().lower()
+        if re.match(r'допрос\w*\s+(?:подозреваем|фигурант)', name):
+            return int(m.group(1))
+        if general is None and re.fullmatch(r'допрос\w*', name):
+            general = int(m.group(1))
+    return general
+
+
+def _restriction_stage(retrieved_context: str):
+    """
+    Номер этапа временных ограничений на имущество методики дела: «Этап 15. Временные ограничения на имущество»
+    (216, 190), «Этап 13. …» (214, 214-1), «ЭТАП 7: ВРЕМЕННЫЕ ОГРАНИЧЕНИЯ» (общая, 218, 307). Нет такого этапа
+    (189: сразу «Наложение ареста») — None: ограничение перед арестом не добавляется.
+    """
+    for title, _body in _methodology_stages(retrieved_context):
+        m = re.match(r'Этап\s+(\d+)\.\s*(.*)', title)
+        if m and re.search(r'ограничени', m.group(2), re.IGNORECASE) and not re.search(r'арест', m.group(2), re.I):
+            return int(m.group(1))
+    return None
+
+
 def _missing_stages(actions: list, retrieved_context: str, case_data: dict) -> list:
     """Этапы методики, не отражённые ни одним пунктом плана и не закрытые проведёнными действиями."""
     # Обязательные первые 3 пункта (изучение материалов СОРМ, проверка по СИО ПСО) добавляются валидатором
     # позже — учитываем их сразу, чтобы не дозапрашивать уже покрытые этапы
     from core.procedural_validator import ensure_mandatory_first_3_items
     mandatory = ensure_mandatory_first_3_items([], case_data=case_data)
-    plan_text = "\n".join((a.get('действие') or '') for a in list(actions) + mandatory).lower()
+    # Запросы в СИО ПСО (не о банках) валидатор потом удаляет (проверка по базе — пункт 3): этап они не закрывают,
+    # иначе «запрос в СИО ПСО … ценные бумаги» засчитывал финансовое расследование, которого в плане не остаётся
+    def _kept(text):
+        t = text.lower()
+        return not (re.match(r'\s*(?:направить|направлен|истребовать|запросить)', t) and 'сио псо' in t
+                    and not re.search(r'банк|\bбву\b|выпис|движени\w*\s+денежн', t))
+    plan_text = "\n".join(t for t in ((a.get('действие') or '') for a in list(actions) + mandatory) if _kept(t)).lower()
     conducted_types = {c.get('тип') for c in case_data.get('проведённые_действия') or []}
     missing = []
     for title, body in _methodology_stages(retrieved_context):
@@ -729,7 +822,9 @@ def _postprocess_generated_actions(generated_actions: list, case_data: dict, cor
     # осмотр изъятого — не раньше выемки, ходатайство об аресте — не раньше постановления и т.д.
     figurants = case_data.get('фигуранты', '')
     generated_actions = distribute_by_days(generated_actions, base_date, figurants=figurants,
-                                           stage_limits=case_data.get('сроки_этапов'))
+                                           stage_limits=case_data.get('сроки_этапов'),
+                                           inspection_stage=case_data.get('этап_осмотров'),
+                                           relative_limits=case_data.get('относительные_сроки_этапов'))
     return enforce_chain_deadlines(generated_actions, figurants=figurants)
 
 
@@ -832,14 +927,14 @@ def generate_investigation_plan(case_data, include_template_actions: bool = True
 
     город_raw = str(case_data.get('место_правонарушения', '')).strip()
     
-    # Если место пустое — извлекаем город из фабулы (|в г. Уральске ...)
+    # Если место пустое — извлекаем город из фабулы (|в г. Астанае ...)
     if not город_raw or 'Н/Д' in город_raw or город_raw in ('Нет', '', 'None', '-'):
         import re as _re
         фабула_для_города = str(case_data.get('фабула_для_заголовка', case_data.get('суть_правонарушения', '')))
-        # Ищем паттерн вида 'в г. Уральске' или 'г. Уральск', а также 'в городе Алматы'
+        # Ищем паттерн вида 'в г. Астанае' или 'г. Астана', а также 'в городе Алматы'
         город_матч = _re.search(r'(?:г\.|городе)[\s\xa0]*([А-Яа-яЁёA-Za-z-]+)', фабула_для_города, _re.IGNORECASE)
         if город_матч:
-            # Нормализуем: 'Уральске' → 'Уральск'
+            # Нормализуем: 'Астанае' → 'Астана'
             город_имя = город_матч.group(1).rstrip('е').rstrip('у')
             if город_имя.lower() in ['астана', 'астану', 'астане']: город_имя = 'Астана'
             elif город_имя.lower() in ['алматы']: город_имя = 'Алматы'
@@ -1308,7 +1403,7 @@ def generate_investigation_plan_with_llm(case_data, llm_client=None,methodology_
     elif not isinstance(current_figurant, str):
         current_figurant = str(current_figurant or '')
     # Из рапорта модель берёт и тех, кто упомянут рядом с подозреваемым («непосредственный руководитель
-    # директор ТОО Раздыкова Г.М.»): кроме первого лица, фигурант — только при данных о подозрении
+    # директор ТОО Андреева Г.М.»): кроме первого лица, фигурант — только при данных о подозрении
     first_figurant = current_figurant.split(',')[0].strip()
     if first_figurant != current_figurant.strip():
         current_figurant = _confirmed_new_figurants(first_figurant, current_figurant, source_corpus)
@@ -1326,7 +1421,7 @@ def generate_investigation_plan_with_llm(case_data, llm_client=None,methodology_
         )
         from core.case_participants import find_person_mentions as _fpm, normalize_text as _nt
         cur_m, best_m = _fpm(_nt(current_figurant)), _fpm(_nt(best_name or ''))
-        # «Байдильдина А.Е.» -> «Байдильдиной А.Е.» — то же лицо в другом падеже: имя не меняем
+        # «Орлова А.Е.» -> «Орловой А.Е.» — то же лицо в другом падеже: имя не меняем
         same_person = cur_m and {m['key'] for m in cur_m} == {m['key'] for m in best_m} \
             and sum(bool(m.get('patronymic')) for m in best_m) <= sum(bool(m.get('patronymic')) for m in cur_m)
         if best_name and best_name != current_figurant and same_person:
@@ -1438,6 +1533,13 @@ def generate_investigation_plan_with_llm(case_data, llm_client=None,methodology_
             generated_actions = _complete_by_methodology(generated_actions, case_data, retrieved_context, llm_client)
             # Предельные сроки этапов методики — для расстановки дат (сохраняются в плане для дозагрузки)
             case_data['сроки_этапов'] = _stage_limits(retrieved_context)
+            case_data['относительные_сроки_этапов'] = _relative_stage_limits(retrieved_context)
+            # Этап «Осмотры» — предел для осмотра полученных по запросам сведений
+            case_data['этап_осмотров'] = _inspection_stage(retrieved_context)
+            # Этап временных ограничений — для ограничения, добавляемого перед арестом
+            case_data['этап_ограничений'] = _restriction_stage(retrieved_context)
+            # Этап допросов подозреваемых — для первоначального допроса каждого фигуранта
+            case_data['этап_допросов_подозреваемых'] = _suspect_interview_stage(retrieved_context)
             # Нумерация, сроки, очистка, статус участников (выдуманные ФИО, сотрудники органа,
             # адвокаты, эксперты), процессуальная валидация и сортировка по блокам УПК РК
             generated_actions = _postprocess_generated_actions(generated_actions, case_data, source_corpus)
@@ -1653,6 +1755,10 @@ def generate_plan_live_from_context(case_number: str, llm_client) -> dict:
             source_corpus = build_source_corpus(case_data, extra_texts=[retrieved_context])
         generated_actions = _complete_by_methodology(generated_actions, case_data, retrieved_context, llm_client)
         case_data['сроки_этапов'] = _stage_limits(retrieved_context)
+        case_data['относительные_сроки_этапов'] = _relative_stage_limits(retrieved_context)
+        case_data['этап_осмотров'] = _inspection_stage(retrieved_context)
+        case_data['этап_ограничений'] = _restriction_stage(retrieved_context)
+        case_data['этап_допросов_подозреваемых'] = _suspect_interview_stage(retrieved_context)
         generated_actions = _postprocess_generated_actions(generated_actions, case_data, source_corpus)
 
         base_plan["actions"] = generated_actions
@@ -1705,8 +1811,8 @@ def _action_fingerprint(action_text: str) -> str:
             action_type = atype
             break
 
-    # Предмет действия: первые значимые слова (кириллица и латиница — «Zhana Business», «Hyundai», «Lumee»),
-    # без служебных слов формулировки: иначе «запрос в Kaspi о счетах ИП Lumee» и «запрос в Kaspi о владельцах
+    # Предмет действия: первые значимые слова (кириллица и латиница — «Дельта Бизнес», «Hyundai», «Омега»),
+    # без служебных слов формулировки: иначе «запрос в Kaspi о счетах ИП Омега» и «запрос в Kaspi о владельцах
     # счетов» давали один отпечаток «направить|запрос|каспи|банк|предоставлении|сведений» и склеивались
     words = [w.lower() for w in re.findall(r'[А-ЯЁа-яёA-Za-z]{4,}', action_text)]
     key_names = tuple(sorted(set(list(dict.fromkeys(w for w in words if w not in _FP_STOP))[:6])))
@@ -1728,8 +1834,12 @@ def _load_saved_corpus(case_data: dict) -> str:
 
 
 def _case_stage_limits(case_data: dict) -> dict:
-    """Сроки этапов методики дела; у планов, созданных до их сохранения, — из сохранённого контекста генерации."""
-    if case_data.get('сроки_этапов') is None:
+    """
+    Сроки этапов методики дела; у планов, созданных до их сохранения, — из сохранённого контекста генерации.
+    Заодно — номер этапа «Осмотры» (case_data['этап_осмотров']), если его ещё нет в плане.
+    """
+    if case_data.get('сроки_этапов') is None or 'этап_осмотров' not in case_data or 'этап_ограничений' not in case_data \
+            or 'этап_допросов_подозреваемых' not in case_data or 'относительные_сроки_этапов' not in case_data:
         номер = sanitize_filename(case_data.get('номер_ердр', case_data.get('номер_дела', 'unknown')))
         path = os.path.join("data", "plans", f"{номер}_pre_context.json")
         context = ''
@@ -1739,7 +1849,17 @@ def _case_stage_limits(case_data: dict) -> dict:
                     context = json.load(f).get("retrieved_context", "") or ""
             except Exception:
                 pass
-        case_data['сроки_этапов'] = _stage_limits(context)
+        if case_data.get('сроки_этапов') is None:
+            case_data['сроки_этапов'] = _stage_limits(context)
+        if 'этап_осмотров' not in case_data:
+            case_data['этап_осмотров'] = _inspection_stage(context)
+        # без сохранённого контекста этап не известен — тогда он берётся у ограничений, уже стоящих в плане
+        if 'этап_ограничений' not in case_data and context:
+            case_data['этап_ограничений'] = _restriction_stage(context)
+        if 'этап_допросов_подозреваемых' not in case_data and context:
+            case_data['этап_допросов_подозреваемых'] = _suspect_interview_stage(context)
+        if 'относительные_сроки_этапов' not in case_data and context:
+            case_data['относительные_сроки_этапов'] = _relative_stage_limits(context)
     return case_data['сроки_этапов']
 
 
@@ -1768,6 +1888,33 @@ def _check_action_sources(actions: list, sources: list) -> list:
         else:
             print(f"  ⛔ [Основание] Документа нет в деле («{basis[:60]}»), пункт удалён: '{a.get('действие', '')[:70]}'")
     return kept
+
+
+def _append_sanctions(new_actions: list, existing: list, case_data: dict) -> list:
+    """
+    Дозагрузка — как при генерации: перед новой выемкой (обыском) — санкция, если её нет ни среди новых пунктов,
+    ни в плане (216, дозагрузка: четыре выемки банковских выписок без санкций); повторная санкция или выемка того же
+    адреса / объекта, что уже в плане, — дубль (предметы дописываются к пункту плана); у новой санкции без
+    исполнения — выемка (обыск). Добавляются только пункты для новых выемок и санкций, план не дополняется.
+    """
+    from core.procedural_validator import (ensure_sanction_before_every_seizure, dedupe_sanctions,
+                                           ensure_execution_after_sanction)
+    existing = list(existing or [])
+    new_ids = {id(a) for a in new_actions}
+    out = ensure_sanction_before_every_seizure(existing + list(new_actions), case_data=case_data)
+    base_ids = new_ids | {id(a) for a in existing}
+    # добавленная санкция стоит прямо перед своей выемкой: берём только санкции к новым выемкам
+    added = {id(x) for i, x in enumerate(out) if id(x) not in base_ids
+             and i + 1 < len(out) and id(out[i + 1]) in new_ids}
+    new_actions = [x for x in out if id(x) in new_ids or id(x) in added]
+    new_ids = {id(a) for a in new_actions}
+    survived = {id(a) for a in dedupe_sanctions(existing + new_actions)}
+    new_actions = [a for a in new_actions if id(a) in survived]
+    new_ids = {id(a) for a in new_actions}
+    out = ensure_execution_after_sanction(existing + new_actions, case_data=case_data)
+    base_ids = new_ids | {id(a) for a in existing}
+    added = {id(x) for i, x in enumerate(out) if id(x) not in base_ids and i > 0 and id(out[i - 1]) in new_ids}
+    return [x for x in out if id(x) in new_ids or id(x) in added]
 
 
 def _filter_append_actions(new_actions: list, plan: dict, new_docs: list, retrieved_context: str,
@@ -1803,10 +1950,17 @@ def _filter_append_actions(new_actions: list, plan: dict, new_docs: list, retrie
     new_actions = _check_action_sources(
         new_actions, (sources or []) + [d.get('filename', '') for d in new_docs or []] + list(plan.get('processed_docs') or []))
     new_actions = _filter_by_status(new_actions, case_data, corpus, conducted=all_conducted)
+    # Банковские санкции (выемки) по разным владельцам одного вида — один пункт, как при генерации
+    from core.procedural_validator import merge_per_person_bank_items
+    new_actions = merge_per_person_bank_items(new_actions)
+    new_actions = _append_sanctions(new_actions, plan.get('actions', []), case_data)
     # Осмотр без запроса -> запрос; для запросов — цепочка «запрос → истребование → осмотр», как при генерации
     from core.procedural_validator import (ensure_request_inspection_followups, deduplicate_requests,
                                            ensure_seizure_before_inspection)
     new_actions = _inspections_to_requests(new_actions, existing_texts)
+    # Адресат, явно противоречащий предмету запроса, — по компетенции органа (как при генерации)
+    from core.procedural_validator import fix_request_addressee
+    new_actions = fix_request_addressee(new_actions)
     # Повторный запрос к тому же адресату по тому же предмету — и среди новых пунктов, и относительно плана
     survived = {id(a) for a in deduplicate_requests(list(plan.get('actions', [])) + new_actions)}
     new_actions = [a for a in new_actions if id(a) in survived]
@@ -1814,11 +1968,29 @@ def _filter_append_actions(new_actions: list, plan: dict, new_docs: list, retrie
     # Осмотр изъятого без выемки (ни в плане, ни в материалах) — осмотр ответа на запрос или выемка перед ним
     new_actions = ensure_seizure_before_inspection(new_actions, case_data=case_data,
                                                    context=plan.get('actions'), conducted=all_conducted)
+    # Вещдок из ответа на запрос — с учётом осмотров и выемок, уже стоящих в плане
+    from core.procedural_validator import drop_answer_evidence
+    new_actions = drop_answer_evidence(new_actions, context=plan.get('actions'))
 
     # Повторный допрос/осмотр того, что уже есть в плане, — дубль
     from core.procedural_validator import deduplicate_semantic
     kept_ids = {id(a) for a in deduplicate_semantic(list(plan.get('actions', [])) + new_actions)}
     new_actions = [a for a in new_actions if id(a) in kept_ids]
+    # Этапы методики (ограничений, допросов подозреваемых) — у старых планов из сохранённого контекста
+    _case_stage_limits(case_data)
+    # Первоначальный допрос — перед новым допросом подозреваемого по существу и каждому фигуранту, у которого его
+    # нет ни в плане, ни в материалах
+    from core.procedural_validator import ensure_initial_suspect_interview
+    new_actions = ensure_initial_suspect_interview(new_actions, case_data=case_data, context=plan.get('actions'),
+                                                   conducted=all_conducted)
+    # Новый допрос свидетелем лица, которое в плане допрашивается как подозреваемый, — лишний
+    from core.procedural_validator import drop_witness_interview_of_suspect
+    new_actions = drop_witness_interview_of_suspect(new_actions, case_data=case_data, context=plan.get('actions'),
+                                                    conducted=all_conducted)
+    # Новый арест — с временным ограничением, если его нет ни в плане, ни в материалах
+    from core.procedural_validator import ensure_restriction_before_arrest
+    new_actions = ensure_restriction_before_arrest(new_actions, case_data=case_data, context=plan.get('actions'),
+                                                   conducted=all_conducted)
     # Осмотр ответа того же органа уже есть в плане («…осмотр полученных сведений из Министерства …»)
     inspected = {_inspected_organ(t) for t in existing_texts} - {''}
     kept = []
@@ -1897,20 +2069,24 @@ def _append_conducted(existing_actions: list, new_actions: list, case_data: dict
 def _dedup_new_actions(existing_actions: list, new_actions: list) -> list:
     """
     Убирает из new_actions:
-    1. Точные совпадения по первым 80 символам.
+    1. Точные совпадения по всему тексту. По первым 80 символам совпадали разные пункты: «Истребовать сведения по
+       запросу в НАО «Правительство для граждан» о регистрации ТОО «…»» о четырёх разных ТОО (216, дозагрузка)
     2. Семантические дубли — действия того же типа с теми же ключевыми словами.
     """
+    def _norm(text):
+        return re.sub(r'\s+', ' ', (text or '').lower()).strip(' .,;')
+
     existing_exact = set()
     existing_fps   = set()
     for a in existing_actions:
         text = a.get('действие', '')
-        existing_exact.add(text[:80].strip())
+        existing_exact.add(_norm(text))
         existing_fps.add(_action_fingerprint(text))
 
     result = []
     for a in new_actions:
         text = a.get('действие', '')
-        key80 = text[:80].strip()
+        key80 = _norm(text)
         fp    = _action_fingerprint(text)
 
         if key80 in existing_exact:
@@ -2457,7 +2633,9 @@ def append_documents_to_plan(plan_path, new_docs_paths=None,llm_client=None, met
     # Сроки новых пунктов — не раньше предыдущих шагов цепочки; сроки утверждённых пунктов не меняются
     from core.procedural_validator import enforce_chain_deadlines, distribute_by_days
     distribute_by_days(plan['actions'], base_date, figurants=case_data.get('фигуранты', ''),
-                       stage_limits=_case_stage_limits(case_data), movable=new_actions)
+                       stage_limits=_case_stage_limits(case_data), movable=new_actions,
+                       inspection_stage=case_data.get('этап_осмотров'),
+                       relative_limits=case_data.get('относительные_сроки_этапов'))
     enforce_chain_deadlines(plan['actions'], movable=new_actions, figurants=case_data.get('фигуранты', ''))
     plan['processed_docs'] = processed_docs + newly_processed
     print(f"➕ Добавлено {len(new_actions)} новых действий. Итого: {len(plan['actions'])}")
@@ -2575,7 +2753,9 @@ def generate_append_live_from_context(case_number: str, llm_client) -> dict:
     plan['actions'] = existing_actions + new_actions
     from core.procedural_validator import enforce_chain_deadlines, distribute_by_days
     distribute_by_days(plan['actions'], base_date, figurants=case_data.get('фигуранты', ''),
-                       stage_limits=_case_stage_limits(case_data), movable=new_actions)
+                       stage_limits=_case_stage_limits(case_data), movable=new_actions,
+                       inspection_stage=case_data.get('этап_осмотров'),
+                       relative_limits=case_data.get('относительные_сроки_этапов'))
     enforce_chain_deadlines(plan['actions'], movable=new_actions, figurants=case_data.get('фигуранты', ''))
     plan['processed_docs'] = processed_docs + newly_processed
     print(f"➕ Добавлено {len(new_actions)} новых действий. Итого: {len(plan['actions'])}")

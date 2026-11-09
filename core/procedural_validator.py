@@ -722,7 +722,10 @@ def ensure_sanction_before_every_seizure(actions: List[Dict], case_data: Optiona
                 is_search_act = 'обыск' in t_lower
                 has_prior_sanction = any(
                     other is not act and _chain_step(other.get('действие', '').lower()) == 'санкция'
-                    and ('обыск' in other.get('действие', '').lower()) == is_search_act and _same_object(other, act)
+                    # с адресами — тот же адрес (216, дозагрузка: выемка у Новиковой «… ул. В. Иванова 34/1» и санкция
+                    # на офис в БЦ «Центр» совпадали по словам «Астана», «адресу», «документов»)
+                    and ('обыск' in other.get('действие', '').lower()) == is_search_act and _same_target(other, act)
+                    and (not _is_bank_seizure(act_text) or _bank_holders_covered(other, act))
                     for other in actions)
 
             if not has_prior_sanction:
@@ -750,6 +753,351 @@ def ensure_sanction_before_every_seizure(actions: List[Dict], case_data: Optiona
     return result
 
 
+_SANCTION_TEXT = re.compile(
+    r'^\s*(?:санкционир\w*|вынести|вынесено)\s+постановлени\w*\s+о\s+производстве\s+(обыска|выемки)\s+(.+)$',
+    re.IGNORECASE | re.DOTALL)
+
+
+def _address_key(text: str) -> str:
+    """
+    Адрес пункта как «город|улица|номера»: «г. Астана, ул. Сакена Сейфуллина, зд.98, БЦ «Центр», кабинет 18» и
+    «…, зд. 98, БЦ «Центр», каб. 18» — один адрес («аста|сакен|98|18»), «ул. Сатпаева, д.98, офис 16» — другой.
+    Город — с заглавной после «г.», чтобы «2023 г. по …» в периоде не принималось за адрес.
+    """
+    m = re.search(r'(?:\bг\.|\bгород)\s*([А-ЯЁӘҒҚҢӨҰҮҺІ][а-яёәғқңөұүһі-]+)([^;()—]*)', text or '')
+    if not m:
+        return ''
+    city, rest = m.group(1).lower(), m.group(2).lower()
+    # Адрес — до перечня изымаемого и периода: «… кабинет 18, с изъятием … за период с 01.01.2023 по 02.06.2025» —
+    # цифры дат не номера дома (216, дозагрузка: санкция и выемка в том же офисе не совпадали)
+    end = re.search(r'\s(?:с\s+изъятием|с\s+целью|изъят|для\s+изъятия|на\s+предмет|за\s+период|в\s+период|период)', rest)
+    rest = re.sub(r'\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b', ' ', rest[:end.start()] if end else rest)
+    street = re.search(r'(?:\bул\.?|\bулиц\w*|\bпр\.|\bпросп\w*|\bпр-т|\bмкр\.?|\bмикрорайон\w*|\bпер\.|\bпереул\w*|'
+                       r'\bбульв\w*|\bб-р|\bшоссе|\bтрасс\w*)\s*([a-zа-яёәғқңөұүһі.]+)', rest)
+    name = re.sub(r'^[a-zа-яё]\.', '', street.group(1)).strip('.') if street else ''
+    nums = re.findall(r'\d+', rest)
+    return f"{city[:4]}|{name[:5]}|{'|'.join(nums)}" if (name or nums) else ''
+
+
+def _is_bank_seizure(text: str) -> bool:
+    """
+    Выемка в банке (банковских досье, выписок): банк — сразу после «выемки» («выемки банковских досье и выписок
+    движения …», «выемки в АО «Kaspi Bank» …»). «Выемка из офиса ТОО …, а также выписок по счетам» — выемка в офисе.
+    """
+    m = re.search(r'(?:выемк|изъят|обыск)\w*', text or '', re.IGNORECASE)
+    window = (text or '')[m.end(): m.end() + 45] if m else ''
+    return bool(re.search(r'банк|bank|\bбву\b|выпис|досье|движени\w*\s+денеж', window, re.IGNORECASE))
+
+
+def _bank_holders_covered(sanction: Dict, act: Dict) -> bool:
+    """
+    Санкция на выемку банковских сведений покрывает выемку, если владельцы счетов те же: лица выемки — среди лиц
+    санкции, организации — среди организаций санкции или это ИП того же лица («ИП «Сидоров А.В.»» при санкции по
+    счетам Сидорова А.В.). «…по всем счетам подозреваемых: Иванова А.Б., …» не покрывает «…по счетам
+    ИП «Лямбда» и ИП «Ипсилон»» (216, дозагрузка: общие слова «банковских», «выписок», «счетам»).
+    """
+    from core.case_participants import find_person_mentions, normalize_text
+    from core.conducted_actions import _quoted_names
+    st, at = sanction.get('действие', ''), act.get('действие', '')
+    s_persons = {p['key'] for p in find_person_mentions(normalize_text(st))}
+    a_persons = {p['key'] for p in find_person_mentions(normalize_text(at))}
+    s_orgs = set(_quoted_names(st))
+    for q in _quoted_names(at):
+        if q in s_orgs:
+            continue
+        in_q = {p['key'] for p in find_person_mentions(normalize_text(q.title()))}
+        if not (in_q and in_q <= s_persons):
+            return False
+    return a_persons <= s_persons
+
+
+def _same_target(a: Dict, b: Dict) -> bool:
+    """
+    Санкция и обыск (выемка) об одном и том же: у разных лиц — разное; при адресах — тот же адрес; иначе — тот же
+    объект. По одним общим словам («офиса», «адресу», «Астана») разные офисы совпадали бы.
+    """
+    from core.case_participants import find_person_mentions, normalize_text
+    pa = {p['key'] for p in find_person_mentions(normalize_text(a.get('действие', '')))}
+    pb = {p['key'] for p in find_person_mentions(normalize_text(b.get('действие', '')))}
+    if pa and pb and not (pa & pb):
+        return False
+    # выемка банковских досье и выписок — не выемка в офисе того же ТОО (216 v6: «счетам», «также» — общие слова)
+    if _is_bank_seizure(a.get('действие', '')) != _is_bank_seizure(b.get('действие', '')):
+        return False
+    aa, ab = _address_key(a.get('действие', '')), _address_key(b.get('действие', ''))
+    if aa and ab:
+        return aa == ab
+    if pa and pb:
+        return True
+    return _same_object(a, b)
+
+
+_STREET_MARK = (r'(?:\bул\.?|\bулиц\w*|\bпр\.|\bпросп\w*|\bпр-т|\bмкр\.?|\bмикрорайон\w*|\bпер\.|\bпереул\w*|'
+                r'\bбульв\w*|\bб-р|\bшоссе|\bтрасс\w*)\s*')
+
+
+def _street_and_house(text: str):
+    """
+    Улица и номер дома из адреса пункта: «г. Астана, ул. К. Сейфуллина, д. 98, офис 16» -> ('сейфуллина', '98').
+    Без улицы или номера — None (такой адрес по материалам не проверить).
+    """
+    from core.case_participants import normalize_text
+    m = re.search(r'(?:\bг\.|\bгород)\s*[А-ЯЁӘҒҚҢӨҰҮҺІ][а-яёәғқңөұүһі-]+([^;()—]*)', text or '')
+    if not m:
+        return None
+    rest = normalize_text(m.group(1)).lower()
+    s = re.search(_STREET_MARK, rest)
+    if not s:
+        return None
+    tail = re.sub(r'^(?:[a-zа-яё]\.\s*)+', '', rest[s.end():])  # «К. Сейфуллина», «Б.Момышулы» — без инициала
+    name = re.match(r'[a-zа-яё-]+', tail)
+    if not name:
+        return None
+    nums = re.findall(r'\d+', tail[name.end():])
+    return (name.group(0), nums[0]) if nums else None
+
+
+def address_in_materials(text: str, corpus: str) -> bool:
+    """
+    Адрес пункта есть в материалах дела: в тексте материалов встречается та же улица (основа названия — с учётом
+    падежа и казахского написания: «Абая» / «Абай даңғылы») и рядом с ней тот же номер дома. Данные — только из
+    материалов этого дела. Адрес, который не проверить (нет улицы или номера), и пустые материалы — считаются известными.
+    """
+    from core.case_participants import normalize_text
+    sh = _street_and_house(text)
+    if not sh or not (corpus or '').strip():
+        return True
+    name, house = sh
+    stem = name[:5] if len(name) >= 7 else name[:max(3, len(name) - 1)]
+    low = normalize_text(corpus).lower().replace('ё', 'е')
+    stem = stem.replace('ё', 'е')
+    house_re = re.compile(rf'(?<!\d){re.escape(house)}(?!\d)')
+    for m in re.finditer(re.escape(stem), low):
+        if house_re.search(low[m.end(): m.end() + 80]):
+            return True
+    return False
+
+
+_RESIDENCE = re.compile(r'(?:по\s+месту|из\s+места|в\s+месте|месту)\s+(?:жительства|проживания)', re.IGNORECASE)
+_OFFICE_MARK = re.compile(r'\bофис\w*|\bкабинет\w*|\bкаб\.|\bБЦ\b|бизнес[-\s]?центр\w*', re.IGNORECASE)
+
+
+def is_office_as_residence(text: str) -> bool:
+    """
+    Санкция, обыск или осмотр изъятого «по месту жительства (из места жительства) X», где адрес — офис:
+    «… БЦ «Центр», кабинет 18 (офис ТОО …)». Адрес — от «жительства» до перечня изымаемого («с изъятием …»);
+    «офис» в перечне («документов офиса») адресом не считается.
+    """
+    t = text or ''
+    m = _RESIDENCE.search(t)
+    if not m or _chain_step(t.lower()) not in ('санкция', 'обыск', 'выемка', 'осмотр_изъятого'):
+        return False
+    rest = t[m.end():]
+    end = re.search(r'\s(?:с\s+изъятием|с\s+целью|изъять|для\s+изъятия|на\s+предмет)\b', rest, re.IGNORECASE)
+    address = rest[:end.start()] if end else rest[:200]
+    return bool(_OFFICE_MARK.search(address))
+
+
+def _seizure_objects(text: str) -> str:
+    """
+    Что изымается: «… кабинет 18, с изъятием всех компьютеров …» -> «всех компьютеров …»; «… с целью проверки …:
+    изъятие табелей учёта …» -> «табелей учёта …»; «Произвести выемку электронных носителей (…) из офиса …» ->
+    «электронных носителей (…)». Без названного предмета («выемку из офиса ТОО … по адресу …») — ''.
+    """
+    t = text or ''
+    m = re.search(r'(?:с\s+изъятием|с\s+целью\s+изъятия|изъяти[ея]|изъять)\s+(.+)$', t, re.IGNORECASE | re.DOTALL)
+    if m:
+        return m.group(1).strip(' .;')
+    m = re.search(r'(?:выемк|обыск)\w*\s+(.+?)\s+(?:из\s+офис|в\s+офис|по\s+адрес|из\s+помещени|в\s+помещени|по\s+месту)',
+                  t, re.IGNORECASE | re.DOTALL)
+    if m and not re.match(r'(?:из|в|по|у)\b', m.group(1), re.IGNORECASE):
+        return m.group(1).strip(' ,;')
+    return ''
+
+
+def dedupe_sanctions(actions: List[Dict]) -> List[Dict]:
+    """
+    Две санкции (или два обыска, две выемки) одного вида на один адрес у тех же лиц — один пункт: «офис преступной
+    группы» и «офис ТОО …» в БЦ «Центр» (216 v3), «…кабинет 18» и «…каб. 18» (216 v4). Пункт без лиц — о том же
+    адресе, что и пункт с лицом («…кабинет 18, … личного ноутбука Соколовой Э.Ж.», 216 v6); разные лица по одному
+    адресу (обыски у Петровой и Сидорова в одном доме) — разные пункты.
+    """
+    from core.case_participants import find_person_mentions, normalize_text
+
+    def _same_persons(x, persons):
+        other = {p['key'] for p in find_person_mentions(normalize_text(x.get('действие', '')))}
+        return other == persons or not other or not persons
+
+    from core.conducted_actions import _quoted_names
+
+    def _no_address_dup(x, t, persons):
+        # Без адреса («выемка банковских выписок по всем счетам ТОО «X» во всех БВУ …» дважды с разным окончанием —
+        # раньше их убирало сравнение первых 80 символов): те же лица, те же названия в кавычках, тот же объект,
+        # обе банковские или обе нет. «… в АО «Kaspi Bank»» и «… в АО «Halyk Bank»» — разные пункты
+        xt = x.get('действие', '')
+        return not _address_key(xt) \
+            and {p['key'] for p in find_person_mentions(normalize_text(xt))} == persons \
+            and set(_quoted_names(xt)) == set(_quoted_names(t)) \
+            and _is_bank_seizure(xt) == _is_bank_seizure(t) \
+            and _same_object({'действие': xt}, {'действие': t})
+
+    result = []
+    for a in actions:
+        t = a.get('действие', '') or ''
+        st = _chain_step(t.lower())
+        if a.get('статус') != 'Исполнен' and st in ('санкция', 'обыск', 'выемка'):
+            persons = {p['key'] for p in find_person_mentions(normalize_text(t))}
+            addr = _address_key(t)
+            dup = next((x for x in result if x.get('статус') != 'Исполнен'
+                        and _chain_step(x.get('действие', '').lower()) == st
+                        and ('обыск' in x.get('действие', '').lower()) == ('обыск' in t.lower())
+                        and ((addr and _address_key(x.get('действие', '')) == addr and _same_persons(x, persons))
+                             or (not addr and _no_address_dup(x, t, persons)))),
+                       None)
+            if dup is not None:
+                what = {'санкция': 'санкция', 'обыск': 'обыск', 'выемка': 'выемка'}[st]
+                where = 'на тот же адрес' if addr else 'того же объекта'
+                # Предметы удалённого пункта не теряются: «выемка электронных носителей» и «выемка печатей и
+                # бланков» в том же офисе (189) — одна выемка со всеми предметами
+                extra = _seizure_objects(t)
+                if extra and _object_words(extra) - _object_words(dup.get('действие', '')):
+                    # предметы — в родительном падеже («с изъятием табелей»): «также изъятие табелей …»
+                    dup['действие'] = dup['действие'].rstrip(' .;') + f"; также изъятие {extra}"
+                print(f"  ✂ [ProceduralValidator] Повторная {what} {where}: '{t[:90]}...' — уже есть: "
+                      f"'{dup.get('действие', '')[:70]}...'" + (" (предметы добавлены к нему)" if extra else ''))
+                continue
+        result.append(a)
+    return result
+
+
+# Владелец счетов, названный организацией: «ТОО «Альфа Строй», БИН 000000000000»
+_HOLDER_ORG = re.compile(r'(?:\b(?:ТОО|АО|ИП|ООО|ПК|КХ|ОО)\s*)?[«"“][^»"”]{2,60}[»"”](?:,?\s*(?:БИН|ИИН)\s*\d{12})?')
+# Санкция / выемка банковских сведений: «Санкционировано постановление о получении банковских выписок по всем
+# счетам …», «Вынести постановление о производстве выемки банковских досье …», «Произвести выемку выписок по счетам …»
+_BANK_ITEM_VERB = re.compile(r'\s*(?:санкционир\w*|вынести\s+постановлени\w*|вынесено\s+постановлени\w*|'
+                             r'произвести\s+выемк\w*|получить\b)', re.IGNORECASE)
+_BANK_ITEM_OBJECT = re.compile(r'банковск\w*\s+(?:выпис|сведени|досье|тайн)|выпис\w*\s+(?:движени|по\s+(?:всем\s+)?сч)',
+                               re.IGNORECASE)
+
+
+def _holder_template(text: str):
+    """Текст без владельца счетов (лица или организации) -> (шаблон, [владельцы как в тексте])."""
+    from core.case_participants import find_person_mentions, normalize_text
+    norm = normalize_text(text)
+    spans = []
+    if len(norm) == len(text):
+        for p in find_person_mentions(norm):
+            end = p['end']
+            iin = re.match(r',?\s*ИИН\s*\d{12}', text[end:])
+            spans.append((p['start'], end + (iin.end() if iin else 0)))
+    from core.conducted_actions import _organs, _quoted_names
+    # банк или орган в кавычках («в АО «Kaspi Bank»») — адресат, а не владелец счетов
+    spans += [(m.start(), m.end()) for m in _HOLDER_ORG.finditer(text)
+              if not any(_organs(q) for q in _quoted_names(m.group(0)))]
+    spans.sort()
+    merged = []
+    for s, e in spans:
+        if merged and s < merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(e, merged[-1][1]))
+        else:
+            merged.append((s, e))
+    template, pos = '', 0
+    for s, e in merged:
+        template += text[pos:s] + '<владелец>'
+        pos = e
+    template += text[pos:]
+    template = re.sub(r'\s+', ' ', template.lower()).strip(' .;')
+    # несколько владельцев подряд («по счетам Иванова И.И., Петрова П.П.») — одно место для перечня; «по всем счетам»
+    # и «по счетам» — одна формулировка
+    template = re.sub(r'<владелец>(?:\s*(?:,|и)\s*<владелец>)+', '<владелец>', template)
+    template = re.sub(r'\bпо\s+всем\s+(сч[её]там)', r'по \1', template)
+    return template, [text[s:e].strip() for s, e in merged]
+
+
+def merge_per_person_bank_items(actions: List[Dict]) -> List[Dict]:
+    """
+    Санкции (выемки) банковских сведений, которые отличаются только владельцем счетов («… по всем счетам, открытым
+    в банках второго уровня РК, на имя Иванова А.Б., за период …» — по пункту на каждого из 9 фигурантов и ТОО),
+    — один пункт со всеми владельцами (автор методики, 06.11.2026: «Да, объединять»). Десять пунктов этапа со сроком
+    5 суток не помещались в первые дни (216 v8). Пункты, отличающиеся чем-то ещё (банк, период, предмет), остаются.
+    """
+    groups = {}
+    for a in actions:
+        t = a.get('действие', '') or ''
+        if a.get('статус') == 'Исполнен' or not _BANK_ITEM_VERB.match(t) or not _BANK_ITEM_OBJECT.search(t):
+            continue
+        template, holders = _holder_template(t)
+        if template.count('<владелец>') == 1:
+            groups.setdefault(template, []).append((a, holders))
+    drop = set()
+    for template, items in groups.items():
+        if len(items) < 2:
+            continue
+        first, first_holders = items[0]
+        names = list(dict.fromkeys(h for _a, hs in items for h in hs))
+        # перечень владельцев первого пункта («Иванова И.И., Петрова П.П.») заменяется полным перечнем
+        t0 = first['действие']
+        start, end = t0.find(first_holders[0]), t0.find(first_holders[-1]) + len(first_holders[-1])
+        first['действие'] = t0[:start] + ', '.join(names) + t0[end:]
+        orders = [_int_field(a.get('очередность')) for a, _h in items if _int_field(a.get('очередность')) is not None]
+        if orders:
+            first['очередность'] = min(orders)
+        drop.update(id(a) for a, _h in items[1:])
+        print(f"  ⚖ [ProceduralValidator] Объединены банковские пункты ({len(items)}) по {len(names)} владельцам счетов в один: "
+              f"'{first['действие'][:110]}...'")
+    return [a for a in actions if id(a) not in drop]
+
+
+def ensure_execution_after_sanction(actions: List[Dict], case_data: Optional[Dict] = None) -> List[Dict]:
+    """
+    Санкция на обыск (выемку) без самого обыска (выемки) — добавляется «Произвести обыск/выемку …» с объектом
+    из текста санкции (216 v3: шесть санкций на обыски без обысков, а осмотр изъятого у Иванова — раньше
+    санкции). Для банков исполнением считается и истребование/запрос в банки о том же. Обыск (выемка), уже
+    проведённые по материалам дела, повторно не добавляются.
+    """
+    from core.case_participants import find_person_mentions, normalize_text
+    from core.conducted_actions import _quoted_names, _orgs_overlap
+    conducted = (case_data or {}).get('проведённые_действия') or []
+    result = []
+    for a in actions:
+        result.append(a)
+        t = a.get('действие', '') or ''
+        if a.get('статус') == 'Исполнен' or _chain_step(t.lower()) != 'санкция':
+            continue
+        m = _SANCTION_TEXT.match(t)
+        if not m:
+            continue
+        kind = 'обыск' if m.group(1).lower().startswith('обыск') else 'выемка'
+        if any(x is not a and _chain_step(x.get('действие', '').lower()) == kind and _same_target(a, x)
+               for x in actions):
+            continue
+        tl = t.lower()
+        if kind == 'выемка' and re.search(r'банк|\bбву\b', tl) and any(
+                _chain_step(x.get('действие', '').lower()) in ('истребование', 'запрос')
+                and re.search(r'банк|\bбву\b', x.get('действие', '').lower()) and _same_object(a, x) for x in actions):
+            continue
+        persons = {p['key'] for p in find_person_mentions(normalize_text(t))}
+        orgs = set(_quoted_names(t))
+        if any(c.get('тип') == kind and ((persons & set(c.get('лица') or []))
+                                         or _orgs_overlap(orgs, c.get('организации'))) for c in conducted):
+            continue
+        target = re.sub(r'\s+и\s+(?:в\s+установленном\s+порядке\s+)?ходатайств.*$', '', m.group(2).strip(),
+                        flags=re.IGNORECASE | re.DOTALL)
+        target = re.sub(r'\s*\(санкционировано[^)]*\)\s*$', '', target, flags=re.IGNORECASE).strip(' .,;')
+        new_text = f"Произвести {'обыск' if kind == 'обыск' else 'выемку'} {target}"
+        execution = {k: v for k, v in a.items() if k in ('направление', 'исполнитель', 'срок', 'этап', 'очередность')}
+        execution.update({
+            'действие': new_text,
+            'статус': 'Не исполнен',
+            'цель': "Обнаружить и изъять предметы, документы, электронные носители и средства, имеющие значение "
+                    "для уголовного дела.",
+            'результат': f"Произведён{'' if kind == 'обыск' else 'а'} {kind}; изъятое описано в протоколе.",
+        })
+        print(f"  ⚖ [ProceduralValidator] Санкция без исполнения — добавлен пункт: '{new_text[:90]}'")
+        result.append(execution)
+    return result
+
+
 def _is_request(text_lower: str) -> bool:
     """Пункт — это направление запроса («Направить запрос …», «Запросить в …»)."""
     return bool(re.match(r'\s*(?:направить|направлен\w*)\s+(?:\w+\s+){0,2}?запрос|\s*запросить\b', text_lower)) \
@@ -758,7 +1106,12 @@ def _is_request(text_lower: str) -> bool:
 
 _REQUEST_STOP = {'направ', 'запрос', 'истреб', 'сведен', 'уполно', 'орган', 'произв', 'осмотр', 'получе',
                  'состав', 'проток', 'докуме', 'период', 'банков', 'второг', 'уровня', 'учрежд', 'отноше',
-                 'запрош', 'предос', 'наличи', 'указан', 'данных'}
+                 'запрош', 'предос', 'наличи', 'указан', 'данных',
+                 # «… фигурантов», «… выписанных от имени ТОО …» — не предмет запроса (216 v6)
+                 'фигура', 'выписа', 'имени',
+                 # «счетов-фактур» уже даёт признак «эсф» — второй раз то же слово не считается: «декларации … по
+                 # счетам-фактурам» совпадали с «версиями ЭСФ» по двум общим словам из одного (216 v7)
+                 'фактур'}
 
 
 def _request_identity(text: str) -> dict:
@@ -766,12 +1119,26 @@ def _request_identity(text: str) -> dict:
     from core.conducted_actions import _organs, _quoted_names
     from core.case_participants import find_person_mentions
     lower = text.lower()
+    mentions = find_person_mentions(text)
+    # ФИО — не предмет: лица сравниваются отдельно, а по фамилиям одних и тех же фигурантов запрос в ЕНПФ о
+    # взносах совпадал с запросом о GPS-перемещениях их автомобилей (216 v6)
+    subject = lower
+    if len(lower) == len(text):
+        for p in sorted(mentions, key=lambda p: -p['start']):
+            subject = subject[:p['start']] + ' ' + subject[p['end']:]
+    quoted = set(_quoted_names(text))
     return {
         'organs': set(_organs(lower)) | ({'сио псо'} if 'сио псо' in lower else set())
                   | ({'бву'} if re.search(r'\bбву\b|банк\w*\s+второго', lower) else set()),
-        'orgs': set(_quoted_names(text)),
-        'persons': {p['key'] for p in find_person_mentions(text)},
-        'stems': {w[:6] for w in re.findall(r'[а-яё]{5,}', lower)} - _REQUEST_STOP,
+        'orgs': quoted,
+        # организации — предмет запроса (не адресат: «НАО «Правительство для граждан»», «АО «Kaspi Bank»»)
+        'subj_orgs': {q for q in quoted if not _organs(q)},
+        'persons': {p['key'] for p in mentions},
+        # «выписки ЭСФ» и «электронные счета-фактуры» — один предмет запроса. Город и область адресата
+        # («ДГД по г. Шымкент», «… по Западно-Казахстанской области») — не предмет: есть почти в каждом запросе дела
+        'stems': ({w[:6] for w in re.findall(r'[а-яё]{5,}', re.sub(
+                      r'\bг\.\s*[а-яёәғқңөұүһі-]+|[а-яёәғқңөұүһі-]+\s+област\w*', ' ', subject))} - _REQUEST_STOP)
+                 | ({'эсф'} if re.search(r'\bэсф\b|сч[её]т\w*-фактур', lower) else set()),
     }
 
 
@@ -782,16 +1149,28 @@ def _same_request(a: dict, b: dict) -> bool:
     if a['persons'] and b['persons'] and not (a['persons'] & b['persons']):
         return False
     # Сведения о лице и сведения об организации — разные запросы
-    # («выписки по счёту КГКП» и «выписки по карте Кубжасарова Р.Ж.»)
+    # («выписки по счёту КГКП» и «выписки по карте Макарова Р.Ж.»)
     if bool(a['persons']) != bool(b['persons']):
         return False
     if a['orgs'] and b['orgs'] and not (a['orgs'] & b['orgs']) and not (a['organs'] & b['organs']):
         return False
-    common = a['stems'] & b['stems']
-    smaller = min(len(a['stems']), len(b['stems'])) or 1
+    # Разные ТОО в предмете — разные запросы и к одному адресату: «в НАО о регистрации ИП «Лямбда» и ТОО «Тета»»
+    # и осмотр ответа НАО о регистрационных делах «Альфа Строй», «Гамма Дом» (216, дозагрузка)
+    sa, sb = a.get('subj_orgs', set()), b.get('subj_orgs', set())
+    if sa and sb and not (sa & sb):
+        return False
+    # Общие лица — один общий признак (а не по слову на каждую фамилию: девять общих фигурантов делали запрос в ЕНПФ
+    # о взносах тем же, что запрос о GPS-перемещениях, 216 v6). Общая организация признаком не считается: «Альфа Строй»
+    # есть почти в каждом запросе дела
+    common = (a['stems'] & b['stems']) | ({'<лица>'} if a['persons'] & b['persons'] else set())
+    smaller = min(len(a['stems']) + bool(a['persons']), len(b['stems']) + bool(b['persons'])) or 1
     if len(common) >= 2 and len(common) / smaller >= 0.5:
         return True
-    return bool((a['organs'] & b['organs']) or (a['orgs'] & b['orgs'])) and len(common) >= 1
+    # Тот же адресат или организация и общее слово — тот же запрос, только если у одной стороны предмета почти нет
+    # («Истребовать сведения по запросу из КГД») или общих слов заметная доля. Иначе разные запросы в КГД об одном
+    # ТОО (ЭСФ и декларации — общие «электронных», «счетов») считались повтором (216 v2–v4)
+    return bool((a['organs'] & b['organs']) or (a['orgs'] & b['orgs'])) and len(common) >= 1 \
+        and (smaller <= 3 or len(common) / smaller >= 0.25)
 
 
 def _same_addressee(a: dict, b: dict) -> bool:
@@ -810,12 +1189,58 @@ def _answers_request(request_ids: dict, other_text: str, sole_request: bool = Fa
     return sole_request and not ids['persons'] and _same_addressee(request_ids, ids)
 
 
+# Компетенция органов (не данные дела — справочник адресатов): ключ — как в conducted_actions._ORGANS,
+# (название адресата, предмет запроса из его компетенции)
+_ORGAN_COMPETENCE = {
+    'пкб': ('АО «Первое кредитное бюро»', r'кредит(?!н\w*\s+бюро)|залог|займ|заём|задолженност'),
+    'есбд': ('ЕСБД (АО «Государственное кредитное бюро»)', r'страхов|полис'),
+    'енпф': ('АО «Единый накопительный пенсионный фонд»', r'пенсион|взнос|отчислени|\bопв\b'),
+    'цдцб': ('АО «Центральный депозитарий ценных бумаг»', r'ценн\w*\s+бумаг|\bакци[йия]\w*|облигац'),
+    'аррфр': ('Агентство по регулированию и развитию финансового рынка', r'брокер|лицензи\w*[^.;]{0,30}финанс'),
+    'мфца': ('МФЦА', r'цифров\w*\s+актив|криптовалют|токен|криптобирж'),
+    'кгд': ('КГД МФ РК', r'налог|деклараци|\bэсф\b|сч[её]т\w*-фактур|\bндс\b|\bкпн\b|камеральн|лицев\w*\s+сч'),
+    'нао': ('НАО «Правительство для граждан»', r'регистрац\w*\s+прав|недвижим|правоустанавл|регистрационн\w*\s+дел'),
+}
+_REQUEST_ADDRESSEE = re.compile(
+    r'(\s*направ\w*\s+(?:\w+\s+){0,2}?запрос\w*\s+(?:в|во)\s+(?:уполномоченн\w+\s+орган\s+)?)(.+?)'
+    r'(\s+(?:о|об|обо|на\s+получение|на\s+предмет|по\s+вопрос\w*|в\s+отношении)\s.+)$', re.IGNORECASE | re.DOTALL)
+
+
+def fix_request_addressee(actions: List[Dict]) -> List[Dict]:
+    """
+    Адресат запроса, явно противоречащий предмету (автор методики, 07.11.2026: «Да, исправлять»): в названии смешаны
+    два органа («в Пенсионный фонд Казахстана (ПКБ) о кредитах, залогах …», 216 v13), а предмет — в компетенции ровно
+    одного из них (_ORGAN_COMPETENCE) -> адресат — он. Сводные запросы со списком органов («в ПКБ, ЦДЦБ, АРРФР и
+    МФЦА …»), запросы с одним адресатом и предмет, подходящий нескольким органам, не меняются.
+    """
+    from core.conducted_actions import _organs
+    for a in actions:
+        t = a.get('действие', '') or ''
+        if a.get('статус') == 'Исполнен' or not _is_request(t.lower()):
+            continue
+        m = _REQUEST_ADDRESSEE.match(t)
+        if not m:
+            continue
+        addr, subj = m.group(2), m.group(3).lower()
+        organs = list(dict.fromkeys(_organs(addr.lower())))
+        if len(organs) < 2 or re.search(r',|\s+и\s+', re.sub(r'\([^)]*\)', '', addr)):
+            continue
+        fit = [k for k in organs if k in _ORGAN_COMPETENCE and re.search(_ORGAN_COMPETENCE[k][1], subj)]
+        if len(fit) != 1:
+            continue
+        new_text = m.group(1) + _ORGAN_COMPETENCE[fit[0]][0] + m.group(3)
+        print(f"  ⚖ [ProceduralValidator] Адресат запроса по предмету: «{addr.strip()}» -> "
+              f"«{_ORGAN_COMPETENCE[fit[0]][0]}»: '{t[:90]}...'")
+        a['действие'] = new_text
+    return actions
+
+
 def deduplicate_requests(actions: List[Dict]) -> List[Dict]:
     """
     До построения цепочки «запрос → истребование → осмотр»:
       • убирает «запросы»/«истребования» в СИО ПСО: это база данных, проверка по ней — обязательный пункт 3,
         а не запрос в орган (иначе каждый такой пункт обрастал своими «истребовать» и «осмотр»);
-      • убирает повторные запросы с тем же предметом («о регистрации Кубжасарова в юрлицах» дважды,
+      • убирает повторные запросы с тем же предметом («о регистрации Макарова в юрлицах» дважды,
         к разным адресатам или без адресата).
     Первые 3 обязательных пункта не трогаются.
     """
@@ -849,10 +1274,22 @@ def deduplicate_requests(actions: List[Dict]) -> List[Dict]:
             # Запросы сравниваются с запросами, истребования — с истребованиями
             seen = seen_requests if _is_request(t_lower) else seen_demands
             ident = _request_identity(text)
-            if any(_same_request(ident, prev) for prev in seen):
-                print(f"  ✂ [ProceduralValidator] Удалён повторный запрос/истребование: '{text[:70]}...'")
+            # Повтор — только если пункт не шире: запрос деклараций ТОО «Альфа Строй», «Эпсилон», «Авика», «Тета»,
+            # «Йота Логистик» — не повтор запроса деклараций одного «Альфа Строй» (216, дозагрузка: четыре ТОО терялись)
+            # Охват — по всем совпавшим пунктам цепочки (запрос и истребования): у автоистребования текст обрезан
+            # («(сведений о предоставлении регистрационных дел…)»), названия ТОО — в самом запросе
+            matched = [(prev, prev_text) for prev, prev_text in seen_requests + seen_demands
+                       if _same_request(ident, prev)]
+            scope_orgs = set().union(*(p['orgs'] for p, _t in matched)) if matched else set()
+            scope_persons = set().union(*(p['persons'] for p, _t in matched)) if matched else set()
+            dup = next((prev_text for prev, prev_text in seen if _same_request(ident, prev)), None) \
+                if ident['orgs'] <= scope_orgs and ident['persons'] <= scope_persons else None
+            if dup is not None:
+                # Полные тексты — чтобы по логу было видно, с каким пунктом совпал удалённый
+                print(f"  ✂ [ProceduralValidator] Удалён повторный запрос/истребование: '{text[:200]}' "
+                      f"— повтор пункта: '{dup[:200]}'")
                 continue
-            seen.append(ident)
+            seen.append((ident, text))
         result.append(act)
     return result
 
@@ -901,6 +1338,11 @@ def ensure_request_inspection_followups(actions: List[Dict], case_data: Optional
                 organ_name = "МФЦА"
             elif re.search(r'\bцдцб\b|центральн\w*\s+депозитари', t_lower):
                 organ_name = "Центральный депозитарий ценных бумаг"
+            elif re.search(r'interpol|интерпол|egmont|эгмонт|\bcarin\b|\barin\b', t_lower):
+                # международные каналы (методика: «запросы через ARIN, CARIN, INTERPOL, EGMONT») — какие названы
+                organ_name = ", ".join(n for n, p in (('ARIN', r'\barin\b'), ('CARIN', r'\bcarin\b'),
+                                                       ('INTERPOL', r'interpol|интерпол'), ('EGMONT', r'egmont|эгмонт'))
+                                       if re.search(p, t_lower))
             elif re.search(r'\bкгд\b', t_lower) or 'налогово' in t_lower:
                 organ_name = "Комитет государственных доходов МФ РК"
             elif re.search(r'\bбву\b|банк|\bbank\b', t_lower):
@@ -952,6 +1394,10 @@ def ensure_request_inspection_followups(actions: List[Dict], case_data: Optional
                 if sub_m:
                     prefix = "на предмет "
             if not sub_m:
+                # «… на получение всех версий электронных счетов-фактур …» (216 v5: без этого истребование было
+                # «(необходимых сведений)», не связывалось с запросом и совпадало с истребованием деклараций)
+                sub_m = re.search(r'\bна\s+получение\s+(.+)', act_text, flags=re.IGNORECASE)
+            if not sub_m:
                 sub_m = re.search(r'\b(об?)\s+(?!истребовании)(.+)', act_text, flags=re.IGNORECASE)
                 if sub_m:
                     # «о движении средств» -> «сведений о движении средств»
@@ -959,6 +1405,10 @@ def ensure_request_inspection_followups(actions: List[Dict], case_data: Optional
 
             if sub_m:
                 subject_info = prefix + sub_m.group(sub_m.lastindex).strip()
+                # «о предоставлении сведений о регистрации …» -> «сведений о регистрации …» (без «сведений о
+                # предоставлении сведений о …»)
+                subject_info = re.sub(r'^сведений\s+о\s+предоставлении\s+сведений\s+(об?)\s+', r'сведений \1 ',
+                                      subject_info, flags=re.IGNORECASE)
                 subject_info = re.sub(rf'^(?:в\s+)?{re.escape(organ_name)}\s*', '', subject_info, flags=re.IGNORECASE).strip()
                 subject_info = re.sub(r'^(?:АО|ТОО|ИС|КГД|АРРФР|ДАПК|ДЭР|БВУ)?\s*[«""][^»""]+[»""]\s*', '', subject_info, flags=re.IGNORECASE).strip()
                 subject_info = subject_info.rstrip(' .;')
@@ -998,8 +1448,9 @@ def ensure_request_inspection_followups(actions: List[Dict], case_data: Optional
                     "результат": f"Получены истребованные сведения по запросу из {organ_decl}.",
                     "исполнитель": act.get("исполнитель") or fio,
                     "срок": act.get("срок") or srok,
-                    # этап запроса — предел срока и для ответа на него (место в очереди — после остальных действий)
-                    "этап": act.get("этап"),
+                    # По методике срок этапа — на отправку запроса; у истребования своего этапа нет: оно между
+                    # запросом и осмотром ответа (место в очереди — после остальных действий)
+                    "этап": None,
                 }
                 result.append(demand_act)
                 print(f"  ⚖ [ProceduralValidator] Автоматически добавлен пункт истребования сведений по запросу из {organ_decl}")
@@ -1014,12 +1465,18 @@ def ensure_request_inspection_followups(actions: List[Dict], case_data: Optional
             if not has_next_inspection:
                 insp_action = {
                     "направление": act.get("направление", "БЛОК 2: Запросы в уполномоченные органы"),
-                    "действие": f"Произвести осмотр полученных сведений по запросу из {organ_decl} (составить протокол осмотра сведений и документов).",
+                    # предмет запроса — как в истребовании: три запроса в один орган о разном давали три одинаковых
+                    # осмотра, и два удалялись как дубли (216 v11)
+                    "действие": (f"Произвести осмотр полученных сведений по запросу из {organ_decl} ({subject_short}); "
+                                 f"составить протокол осмотра сведений и документов."
+                                 if subject_info != "необходимых сведений" else
+                                 f"Произвести осмотр полученных сведений по запросу из {organ_decl} (составить протокол осмотра сведений и документов)."),
                     "цель": f"Детально изучить, зафиксировать сведения, полученные по запросу из {organ_decl}, и приобщить их к материалам уголовного дела.",
                     "результат": f"Составлен протокол осмотра полученных сведений по запросу из {organ_decl}.",
                     "исполнитель": act.get("исполнитель") or fio,
                     "срок": act.get("срок") or srok,
-                    "этап": act.get("этап"),
+                    # осмотр полученных сведений — этап «Осмотры» методики (до 30 суток), а не этап запроса
+                    "этап": (case_data or {}).get('этап_осмотров'),
                 }
                 result.append(insp_action)
                 print(f"  ⚖ [ProceduralValidator] Автоматически добавлен пункт осмотра полученных сведений по запросу из {organ_decl}")
@@ -1060,6 +1517,32 @@ def _same_seized(obj: str, inspection_lower: str, other: str) -> bool:
     words = _object_words(obj) - {'предме', 'докуме', 'электр', 'носите'}
     return (not words or bool(words & _object_words(other))
             or bool(_ACCOUNT_DATA.search(inspection_lower) and _ACCOUNT_DATA.search(other.lower())))
+
+
+def _residence_of(text: str, case_data: Optional[Dict]):
+    """
+    «… изъятых … из места жительства Поповой С.М.» -> ('Поповой С.М.', 'г. Астана, проспект Абая, дом 106, кв. 47'):
+    лицо — как в тексте (родительный падеж), адрес — «место жительства фигуранта (ФИО): адрес» из адресов дела;
+    адреса нет — ('Васильева Т.Б', ''). Не о месте жительства — None.
+    """
+    from core.case_participants import find_person_mentions, normalize_text
+    m = re.search(r'(?:из|по|в)\s+мест\w*\s+(?:жительства|проживания)\s+', text or '', re.IGNORECASE)
+    if not m:
+        return None
+    tail = text[m.end():]
+    norm = normalize_text(tail)
+    found = find_person_mentions(norm)
+    if not found or found[0]['start'] > 30:
+        return None
+    src = tail if len(tail) == len(norm) else norm
+    name = src[found[0]['start']:found[0]['end']].strip()
+    key = found[0]['key']
+    for am in re.finditer(r'мест\w*\s+жительства[^()\n]*\(([^)\n]+)\)\s*:\s*([^\n]+)',
+                          (case_data or {}).get('адреса_фигурантов', '') or '', re.IGNORECASE):
+        who = find_person_mentions(normalize_text(am.group(1)))
+        if who and who[0]['key'] == key:
+            return name, am.group(2).strip().rstrip('.;')
+    return name, ''
 
 
 def ensure_seizure_before_inspection(actions: List[Dict], case_data: Optional[Dict] = None,
@@ -1110,6 +1593,31 @@ def ensure_seizure_before_inspection(actions: List[Dict], case_data: Optional[Di
             print(f"  ⚖ [ProceduralValidator] Осмотр «изъятых» без выемки -> осмотр полученных по запросу: '{act['действие'][:70]}...'")
             result.append(act)
             continue
+        # Изъятое «из места жительства X» — по обыску жилища, а не по выемке: обыск по адресу X из материалов дела,
+        # а если адреса в материалах нет — осмотр удаляется (216 v8: «выемка … из места жительства Васильева Т.Б»
+        # без адреса)
+        home = _residence_of(text, case_data)
+        if home is not None:
+            name, address = home
+            if not address:
+                print(f"  ✂ [ProceduralValidator] Осмотр изъятого из места жительства {name}: обыска нет, адреса в "
+                      f"материалах нет — пункт удалён: '{text[:90]}...'")
+                continue
+            search = {k: act.get(k) for k in ('направление', 'исполнитель', 'срок', 'этап', 'очередность')}
+            search.update({
+                "действие": f"Произвести обыск по месту жительства {name}: {address}",
+                "цель": "Обнаружить и изъять предметы, документы, электронные носители, имеющие значение для дела.",
+                "результат": "Произведён обыск; изъятое описано в протоколе.",
+            })
+            added = ensure_sanction_before_every_seizure([search], case_data=case_data)
+            for extra in added:
+                extra.setdefault("этап", act.get("этап"))
+                extra.setdefault("очередность", act.get("очередность"))
+            print(f"  ⚖ [ProceduralValidator] Осмотр изъятого из места жительства без обыска — добавлены санкция и обыск: "
+                  f"'{search['действие'][:90]}'")
+            result.extend(added)
+            result.append(act)
+            continue
         # Выемки нет и запроса нет — сначала санкционирование и выемка того же объекта
         # («изъятых предметов и документов» без владельца — объект и место выемки из материалов дела)
         if not owners and not (_object_words(obj) - {'предме', 'докуме', 'электр', 'носите'}):
@@ -1158,6 +1666,10 @@ def _chain_step(text_lower: str) -> Optional[str]:
         if re.search(r'изъят', t):
             return 'осмотр_изъятого'
         return 'осмотр_сведений' if re.search(r'полученн|выпис|ответ', t) else None
+    # «Вынести постановление о временном ограничении распоряжения имуществом X» — до ареста имущества X
+    # (Порядок, п. 24: ограничение до 10 суток, затем ходатайство об аресте)
+    if re.search(r'временн\w*\s+ограничени|ограничени\w*\s+(?:на\s+)?распоряжени', t) and not re.search(r'арест', t):
+        return 'ограничение'
     # «Ходатайствовать … о санкционировании постановления о наложении ареста» — после самого постановления
     if re.search(r'санкционир\w*[^.;]{0,80}?арест', t):
         return 'санкция_ареста'
@@ -1171,7 +1683,7 @@ def _chain_step(text_lower: str) -> Optional[str]:
 _CHAIN_STOP = {'произв', 'провес', 'вынест', 'постан', 'осмотр', 'изъяты', 'изъято', 'выемку', 'выемки', 'обыска',
                'санкци', 'ходата', 'призна', 'качест', 'вещест', 'доказа', 'приобщ', 'матери', 'уголов', 'назнач',
                'экспер', 'следст', 'судьей', 'состав', 'проток', 'период', 'имеющи', 'значен', 'порядк', 'устано',
-               'респуб', 'казахс', 'област', 'города', 'изъяти', 'изъять', 'целью'}
+               'респуб', 'казахс', 'област', 'города', 'изъяти', 'изъять', 'целью', 'также'}
 
 
 def _object_words(text: str) -> set:
@@ -1203,6 +1715,443 @@ def _same_object(a: Dict, b: Dict) -> bool:
 # Слова, по которым объект не различить: «предметов и документов»
 _GENERIC_OBJECT = {'предме', 'докуме'}
 
+# «Допросить подозреваемого X (первоначальный допрос) …»
+_INITIAL_INTERVIEW = re.compile(r'первоначальн', re.IGNORECASE)
+
+
+# Роль допрашиваемого перед ФИО — не подозреваемый: «допросить сотрудника / директора / представителя … — Иванова»
+_NONSUSPECT_ROLE = re.compile(r'свидетел|потерпевш|сотрудник|директор|руководител|бухгалтер|представител|учредител|'
+                              r'собственник|работник|менеджер|водител|продав|покупател|специалист|эксперт|'
+                              r'работодател|арендодател|арендатор', re.IGNORECASE)
+
+
+def _suspect_interviewee(text: str, figurant_keys: set):
+    """
+    Если пункт — допрос подозреваемого (обвиняемого): (ключ лица, ФИО как в тексте, «подозреваемого/…» перед ФИО
+    или None). Подозреваемый — первое лицо в пункте, если оно фигурант или перед ним «подозреваемого».
+    """
+    from core.case_participants import find_person_mentions, normalize_text
+    if _chain_step((text or '').lower()) != 'допрос':
+        return None
+    norm = normalize_text(text)
+    found = find_person_mentions(norm)
+    if not found:
+        return None
+    first = found[0]
+    head = norm[:first['start']]
+    word = re.search(r'(?:подозреваем|обвиняем)\w*', head, re.IGNORECASE)
+    if not (first['key'] in figurant_keys or word
+            or re.search(r'в\s+качестве\s+(?:подозреваем|обвиняем)', norm, re.IGNORECASE)):
+        return None
+    if re.search(r'свидетел|потерпевш', head, re.IGNORECASE) or \
+            re.match(r'[\s,]*в\s+качестве\s+(?:свидетел|потерпевш)', norm[first['end']:], re.IGNORECASE):
+        return None
+    # «Допросить сотрудника офиса … — Иванова И.И.», «Допросить директора ТОО «А» — Петрова П.П.»: допрос в роли
+    # сотрудника / директора, а не подозреваемого (216 v12)
+    if not word and _NONSUSPECT_ROLE.search(head) \
+            and not re.search(r'в\s+качестве\s+(?:подозреваем|обвиняем)', norm, re.IGNORECASE):
+        return None
+    # normalize_text меняет буквы один к одному — ФИО берётся из исходного текста по тем же позициям
+    src = text if len(text) == len(norm) else norm
+    return first['key'], src[first['start']:first['end']], (src[word.start():word.end()] if word else None)
+
+
+def _figurant_keys(case_data: Optional[Dict]) -> set:
+    from core.case_participants import find_person_mentions, normalize_text
+    figs = (case_data or {}).get('фигуранты', '')
+    if isinstance(figs, list):
+        figs = ', '.join(f.get('фио', '') if isinstance(f, dict) else str(f) for f in figs)
+    return {p['key'] for p in find_person_mentions(normalize_text(figs or ''))}
+
+
+def _is_female(key: str, case_data: Optional[Dict]) -> bool:
+    """Пол фигуранта — из «фигуранты_с_полом» этого дела («Иванова А.Б. (женский пол)»)."""
+    from core.case_participants import find_person_mentions, normalize_text
+    for part in re.split(r'\),\s*', (case_data or {}).get('фигуранты_с_полом', '') or ''):
+        found = find_person_mentions(normalize_text(part))
+        if found and found[0]['key'] == key:
+            return 'женск' in part
+    return False
+
+
+def fix_suspect_gender(text: str, case_data: Optional[Dict] = None) -> str:
+    """
+    «Допросить подозреваемого Петрову О.Л.» → «подозреваемую», «имущество подозреваемого Смирновой И.Н.» →
+    «подозреваемой»: род — по полу лица из «фигуранты_с_полом» этого дела, падеж — по окончанию фамилии.
+    Мужские и несклоняемые фамилии («Серікқызы») не трогаются.
+    """
+    from core.case_participants import find_person_mentions, normalize_text
+    if not text or not (case_data or {}).get('фигуранты_с_полом'):
+        return text
+
+    def repl(m):
+        rest = m.group(2)
+        found = find_person_mentions(normalize_text(rest))
+        if not found or found[0]['start'] > 2 or not _is_female(found[0]['key'], case_data):
+            return m.group(1)
+        surname = rest.split()[0].lower() if rest.split() else ''
+        if re.search(r'[ую]$', surname):
+            return m.group(1)[:-3] + 'ую'
+        if re.search(r'[оеё]й$', surname):
+            return m.group(1)[:-3] + 'ой'
+        return m.group(1)
+
+    return re.sub(r'\b((?:подозреваем|обвиняем)ого)(?=(\s+[А-ЯЁӘҒҚҢӨҰҮҺІ][^\n]{0,60}))', repl, text)
+
+
+def ensure_initial_suspect_interview(actions: List[Dict], case_data: Optional[Dict] = None,
+                                     context: Optional[List[Dict]] = None,
+                                     conducted: Optional[List[Dict]] = None) -> List[Dict]:
+    """
+    Первоначальный допрос подозреваемого в плане обязателен (автор методики, 05.11.2026): когда допрашивать по
+    существу — по обстоятельствам дела, но первоначальный допрос должен быть. Если по лицу в плане есть только
+    допрос по существу («по установленным противоречиям»), а в материалах его допроса в качестве подозреваемого
+    нет, перед ним добавляется «Допросить подозреваемого X (первоначальный допрос) …». Его очередь — сразу после
+    обыска (выемки) у этого лица, а если такого нет — после обысков и выемок по делу; дата — по цепочке.
+    context — пункты, уже стоящие в плане (при дозагрузке): первоначальный допрос там тоже учитывается.
+    """
+    conducted = conducted if conducted is not None else (case_data or {}).get('проведённые_действия') or []
+    fkeys = _figurant_keys(case_data)
+    done = {k for c in conducted if c.get('тип') == 'допрос' and c.get('роль') in ('подозреваемого', 'обвиняемого')
+            for k in c.get('лица') or []}
+    have = set()
+    for a in list(context or []) + actions:
+        who = _suspect_interviewee(a.get('действие', ''), fkeys)
+        if who and (_INITIAL_INTERVIEW.search(a.get('действие', '')) or a.get('статус') == 'Исполнен'):
+            have.add(who[0])
+
+    def _order_after_search(initial):
+        """Очередь — как у обыска (выемки) этого лица по цепочке (лицо — в пункте обыска или в его санкции)."""
+        pending = [x for x in actions if x.get('статус') != 'Исполнен'] + [initial]
+        _o, preds = _chain_links(pending, (case_data or {}).get('фигуранты', '') if isinstance(
+            (case_data or {}).get('фигуранты', ''), str) else '')
+        # Этап остаётся «Допросы подозреваемых»: с этапом обыска (срок до 7 суток) все первоначальные допросы
+        # сходились в последний день этого этапа сверх нормы 3 действий в день
+        own = [p for p in preds.get(id(initial), []) if _int_field(p.get('очередность')) is not None]
+        every = [x for x in actions if _chain_step(x.get('действие', '').lower()) in ('обыск', 'выемка')
+                 and _int_field(x.get('очередность')) is not None]
+        src = max(own or every, key=lambda x: _int_field(x.get('очередность')), default=None)
+        return _int_field(src.get('очередность')) if src else None
+
+    result = []
+    for a in actions:
+        text = a.get('действие', '') or ''
+        who = _suspect_interviewee(text, fkeys) if a.get('статус') != 'Исполнен' else None
+        if who and who[0] not in have and who[0] not in done and not _INITIAL_INTERVIEW.search(text):
+            key, name, word = who
+            female = _is_female(key, case_data)
+            if word:
+                # Род — по полу лица из материалов («подозреваемого Петрову» у модели — ошибка рода)
+                base = 'обвиняем' if word.lower().startswith('обвиняем') else 'подозреваем'
+                new_text = (f"Допросить {base}{'ую' if female else 'ого'} {name} (первоначальный допрос) "
+                            f"по обстоятельствам подозрения")
+            else:
+                role = 'подозреваемой' if female else 'подозреваемого'
+                new_text = f"Допросить {name} в качестве {role} (первоначальный допрос) по обстоятельствам подозрения"
+            initial = {k: v for k, v in a.items() if k in ('направление', 'исполнитель', 'срок', 'этап', 'статус')}
+            initial.update({
+                'действие': new_text,
+                'цель': "Получить показания подозреваемого по обстоятельствам подозрения, разъяснить права "
+                        "и обеспечить право на защиту.",
+                'результат': "Допрошен подозреваемый; показания сопоставляются с собранными доказательствами.",
+            })
+            order_n = _order_after_search(initial)
+            if order_n is not None:
+                initial['очередность'] = order_n
+            print(f"  ➕ [ProceduralValidator] Добавлен первоначальный допрос подозреваемого: '{new_text[:90]}'")
+            result.append(initial)
+            have.add(key)
+        result.append(a)
+
+    # Каждый фигурант допрашивается первоначально (автор методики, 06.11.2026: «нужно всех фигурантов допросить
+    # первоначально, если нет»): фигуранту без допроса подозреваемым — ни в плане, ни в материалах — пункт
+    # «Допросить подозреваемого X (первоначальный допрос)». Его свидетельский допрос в плане затем удаляется
+    # (drop_witness_interview_of_suspect). Этап — как у допросов подозреваемых в плане, иначе этап методики
+    pool = list(context or []) + result
+    stages = [_int_field(x.get('этап')) for x in pool
+              if _suspect_interviewee(x.get('действие', ''), fkeys) and _int_field(x.get('этап')) is not None]
+    stage = max(set(stages), key=stages.count) if stages else (case_data or {}).get('этап_допросов_подозреваемых')
+    fio, srok = _extract_investigator_and_deadline(case_data)
+    for key, name_nom in _figurant_names(case_data):
+        if key in have or key in done:
+            continue
+        female = _is_female(key, case_data)
+        new_text = (f"Допросить {'подозреваемую' if female else 'подозреваемого'} {_accusative_fio(name_nom, female)} "
+                    f"(первоначальный допрос) по обстоятельствам подозрения")
+        initial = {
+            'действие': new_text,
+            'статус': 'Не исполнен',
+            'этап': stage,
+            'исполнитель': fio,
+            'срок': srok,
+            'цель': "Получить показания подозреваемого по обстоятельствам подозрения, разъяснить права "
+                    "и обеспечить право на защиту.",
+            'результат': "Допрошен подозреваемый; показания сопоставляются с собранными доказательствами.",
+        }
+        initial['направление'] = PROCEDURAL_BLOCKS[classify_action_block(initial)]
+        order_n = _order_after_search(initial)
+        if order_n is not None:
+            initial['очередность'] = order_n
+        print(f"  ➕ [ProceduralValidator] Фигурант без первоначального допроса — добавлен: '{new_text[:90]}'")
+        result.append(initial)
+        have.add(key)
+    return result
+
+
+def _figurant_names(case_data: Optional[Dict]) -> List[tuple]:
+    """[(ключ, ФИО в именительном падеже)] фигурантов дела — из «фигуранты» (через запятую или список)."""
+    from core.case_participants import find_person_mentions, normalize_text
+    figs = (case_data or {}).get('фигуранты', '')
+    parts = [f.get('фио', '') if isinstance(f, dict) else str(f) for f in figs] if isinstance(figs, list) \
+        else re.split(r',\s*', figs or '')
+    result, seen = [], set()
+    for part in parts:
+        part = part.strip()
+        found = find_person_mentions(normalize_text(part))
+        if found and found[0]['key'] not in seen:
+            seen.add(found[0]['key'])
+            result.append((found[0]['key'], part))
+    return result
+
+
+_CONSONANT = 'бвгджзклмнпрстфхцчшщғқңһ'
+
+
+def _accusative_fio(name: str, female: bool) -> str:
+    """
+    ФИО в винительном падеже для «Допросить подозреваемого …»: «Васильев Тимур Булатович» -> «Васильева Тимура
+    Булатовича», «Соколова Эльмира Жангелдиевна» -> «Соколову Эльмиру Жангелдиевну». Несклоняемые части (женские
+    имена на согласную — «Салтанат», казахские «-улы/-кызы», фамилии на -о, -их) и инициалы — как есть.
+    """
+    def surname(w):
+        low = w.lower()
+        if female:
+            if re.search(r'(?:ов|ев|ёв|ин|ын)а$', low):
+                return w[:-1] + 'у'
+            if re.search(r'ая$', low):
+                return w[:-2] + 'ую'
+            return w
+        if re.search(r'(?:ск|цк)ий$', low) or (re.search(r'[ыо]й$', low) and len(low) >= 5):
+            return w[:-2] + 'ого'  # Донской -> Донского
+        if low.endswith(('й', 'ь')):
+            return w[:-1] + 'я'  # Цой -> Цоя
+        if low[-1:] in _CONSONANT:
+            return w + 'а'
+        return w
+
+    def first(w):
+        low = w.lower()
+        if low.endswith('а'):
+            return w[:-1] + 'у'
+        if low.endswith('я'):
+            return w[:-1] + 'ю'
+        if female:
+            return w
+        if low.endswith(('й', 'ь')):
+            return w[:-1] + 'я'
+        if low[-1:] in _CONSONANT:
+            return w + 'а'
+        return w
+
+    def patronymic(w):
+        low = w.lower()
+        if female:
+            return w[:-1] + 'у' if re.search(r'(?:вн|чн)а$', low) else w
+        return w + 'а' if low.endswith('ич') else w
+
+    words = name.split()
+    if not words:
+        return name
+    out = [surname(words[0])]
+    for i, w in enumerate(words[1:3], start=1):
+        if re.fullmatch(r'(?:[A-ZА-ЯЁӘҒҚҢӨҰҮҺІ]\.)+', w):  # инициалы
+            out.append(w)
+        else:
+            out.append(first(w) if i == 1 else patronymic(w))
+    return ' '.join(out + words[3:])
+
+
+def drop_witness_interview_of_suspect(actions: List[Dict], case_data: Optional[Dict] = None,
+                                      context: Optional[List[Dict]] = None,
+                                      conducted: Optional[List[Dict]] = None) -> List[Dict]:
+    """
+    Допрос в качестве свидетеля лица, которое в плане допрашивается как подозреваемый (или уже допрошено так по
+    материалам), — лишний: подозреваемый свидетелем не допрашивается (216, дозагрузка: «Допросить свидетеля
+    Морозова К.Ж. по существу» при допросах подозреваемого Морозова). context — пункты, уже стоящие в плане.
+    """
+    from core.case_participants import find_person_mentions, normalize_text
+    conducted = conducted if conducted is not None else (case_data or {}).get('проведённые_действия') or []
+    fkeys = _figurant_keys(case_data)
+    suspects = {k for c in conducted if c.get('тип') == 'допрос' and c.get('роль') in ('подозреваемого', 'обвиняемого')
+                for k in c.get('лица') or []}
+    for a in list(context or []) + list(actions):
+        who = _suspect_interviewee(a.get('действие', ''), fkeys)
+        if who:
+            suspects.add(who[0])
+    result = []
+    for a in actions:
+        text = a.get('действие', '') or ''
+        if a.get('статус') != 'Исполнен' and _chain_step(text.lower()) == 'допрос' \
+                and _suspect_interviewee(text, fkeys) is None:
+            norm = normalize_text(text)
+            found = find_person_mentions(norm)
+            # свидетелем или в другой роли («сотрудника офиса … — Иванова», «директора ТОО … — Петрова»). Лицо после
+            # предлога или причастия — не допрашиваемый: «бухгалтера, заменившего Иванову И.И.» — допрос бухгалтера
+            before = norm[:found[0]['start']] if found else ''
+            mentioned_only = re.search(r'(?:\b(?:о|об|обо|по|с|со|у|от|для|при|про|вместо|после|до|за|между)\s+'
+                                       r'|в\s+отношении\s+|\w+(?:вш|ющ|ящ|ущ|ащ)\w*\s+)$', before, re.IGNORECASE)
+            if found and found[0]['key'] in suspects and not mentioned_only and (
+                    _NONSUSPECT_ROLE.search(before)
+                    or re.match(r'[\s,]*в\s+качестве\s+свидетел', norm[found[0]['end']:], re.IGNORECASE)):
+                print(f"  ✂ [ProceduralValidator] Допрос в роли свидетеля / сотрудника лица, допрашиваемого как "
+                      f"подозреваемый, — удалён: '{text[:100]}...'")
+                continue
+        result.append(a)
+    return result
+
+
+# «ТОО «Альфа Строй»», «АО «…»» — организация, чьё имущество арестовывается
+_ORG_NAME = re.compile(r'\b(?:ТОО|АО|ИП|ООО|ПК|КХ|ОО|ОФ|ГКП|РГП|ГУ)\s*[«"“]([^»"”]+)[»"”]')
+# Слово, после которого ФИО стоит в родительном падеже: «имущество (подозреваемого) Иванова И.И.», «счета Ивановой»
+_GENITIVE_HEAD = re.compile(r'(?:имуществ\w*|средств\w*|сч[её]т\w*|дол[еиюя]\w*|актив\w*)\s+'
+                            r'((?:подозреваем|обвиняем)\w*\s+)?$', re.IGNORECASE)
+
+
+def _surname_genitive(surname: str, female: bool) -> str:
+    """Родительный падеж фамилии: Иванов → Иванова, Иванова → Ивановой; несклоняемые (Серікқызы, Шевченко) — как есть."""
+    low = surname.lower()
+    if female:
+        if re.search(r'(?:ов|ев|ёв|ин|ын)а$', low):
+            return surname[:-1] + 'ой'
+        if re.search(r'(?:ск|цк)ая$', low):
+            return surname[:-2] + 'ой'
+        return surname
+    if re.search(r'(?:ск|цк)ий$', low):
+        return surname[:-2] + 'ого'
+    if re.search(r'[бвгджзклмнпрстфхцчшщ]$', low):
+        return surname + 'а'
+    return surname
+
+
+def _owner_genitive(text: str, mention: Dict, case_data: Optional[Dict]) -> str:
+    """
+    «подозреваемого Кузнецова Тугелбая Амантаевича» — владелец имущества в родительном падеже. Если в тексте ареста ФИО
+    стоит после «имущество (подозреваемого)», оно берётся как есть; иначе («средства, полученные Николаевой Э.Д.») —
+    фамилия с инициалами из списка фигурантов дела в родительном падеже.
+    """
+    from core.case_participants import find_person_mentions, normalize_text
+    norm = normalize_text(text)
+    src = text if len(text) == len(norm) else norm
+    head = _GENITIVE_HEAD.search(norm[:mention['start']])
+    female = _is_female(mention['key'], case_data)
+    if head:
+        # род — по полу лица из материалов («подозреваемого Петровой» у модели — ошибка рода)
+        role = re.sub(r'(?:ого|ой|ую)$', 'ой' if female else 'ого', (head.group(1) or '').strip())
+        return (role + ' ' if role else '') + src[mention['start']:mention['end']]
+    figs = (case_data or {}).get('фигуранты', '')
+    if isinstance(figs, list):
+        figs = ', '.join(f.get('фио', '') if isinstance(f, dict) else str(f) for f in figs)
+    for part in re.split(r',\s*', figs or ''):
+        found = find_person_mentions(normalize_text(part))
+        if found and found[0]['key'] == mention['key']:
+            words = part.split()
+            initials = ''.join(w[0].upper() + '.' for w in words[1:3] if w and w[0].isalpha())
+            return f"{_surname_genitive(words[0], female)} {initials}".strip()
+    return src[mention['start']:mention['end']]
+
+
+def ensure_restriction_before_arrest(actions: List[Dict], case_data: Optional[Dict] = None,
+                                     context: Optional[List[Dict]] = None,
+                                     conducted: Optional[List[Dict]] = None) -> List[Dict]:
+    """
+    Арест имущества — после временного ограничения распоряжения им (методика: «Временные ограничения на имущество»,
+    затем «Наложение ареста»; автор методики, 06.11.2026 — добавлять, если модель ограничение пропустила). Перед
+    арестом имущества лица (организации), по которому в плане нет ограничения, а в материалах нет ни ограничения, ни
+    ареста, добавляется «Вынести постановление о временном ограничении распоряжения имуществом X …».
+    Этап — этап ограничений методики дела (case_data['этап_ограничений']); если в методике такого этапа нет (189),
+    ничего не добавляется. В планах без этого поля этап берётся у ограничений, уже стоящих в плане.
+    context — пункты, уже стоящие в плане (при дозагрузке).
+    """
+    from core.case_participants import find_person_mentions, normalize_text
+    case_data = case_data or {}
+    conducted = conducted if conducted is not None else case_data.get('проведённые_действия') or []
+    everything = list(context or []) + list(actions)
+    restrictions = [a for a in everything if _chain_step(a.get('действие', '').lower()) == 'ограничение']
+    if 'этап_ограничений' in case_data:
+        stage = case_data.get('этап_ограничений')
+    else:
+        stages = [_int_field(a.get('этап')) for a in restrictions if _int_field(a.get('этап')) is not None]
+        stage = max(set(stages), key=stages.count) if stages else None
+    if stage is None:
+        return actions
+
+    def _orgs(text):
+        return {m.group(1).strip().lower() for m in _ORG_NAME.finditer(text)}
+
+    covered_persons, covered_orgs, generic = set(), set(), False
+    for r in restrictions:
+        t = r.get('действие', '')
+        keys = {m['key'] for m in find_person_mentions(normalize_text(t))}
+        orgs = _orgs(t)
+        covered_persons |= keys
+        covered_orgs |= orgs
+        generic |= not keys and not orgs  # «… имуществом всех фигурантов»
+    for c in conducted:
+        if c.get('тип') == 'арест':  # в материалах тип «арест» — и арест, и временное ограничение
+            covered_persons |= set(c.get('лица') or [])
+            covered_orgs |= {o.lower() for o in c.get('организации') or []}
+    if generic:
+        return actions
+
+    result = []
+    for a in actions:
+        text = a.get('действие', '') or ''
+        if a.get('статус') == 'Исполнен' or _chain_step(text.lower()) != 'арест':
+            result.append(a)
+            continue
+        # Владелец — лицо (организация) после «имущество / средства / счета …»; «арест на средства ТОО «X»,
+        # директор Иванов И.И.» — имущество ТОО, а не Иванова. Без такого слова («средства, полученные
+        # Николаевой Э.Д.») — названные в пункте лица, а если их нет — организации
+        norm = normalize_text(text)
+        mentions = find_person_mentions(norm)
+        orgs = list(_ORG_NAME.finditer(text))
+        persons_h = [m for m in mentions if _GENITIVE_HEAD.search(norm[:m['start']])]
+        orgs_h = [m for m in orgs if _GENITIVE_HEAD.search(text[:m.start()])]
+        if persons_h or orgs_h:
+            persons, orgs = persons_h, orgs_h
+        elif mentions:
+            persons, orgs = mentions, []
+        else:
+            persons = []
+        owners = []
+        for m in persons:
+            if m['key'] not in covered_persons and m['key'] not in {o[0] for o in owners}:
+                owners.append((m['key'], _owner_genitive(text, m, case_data)))
+        for m in orgs:
+            name = m.group(1).strip().lower()
+            if name not in covered_orgs and 'org:' + name not in {o[0] for o in owners}:
+                owners.append(('org:' + name, m.group(0)))
+        for key, owner in owners:
+            new_text = (f"Вынести постановление о временном ограничении распоряжения имуществом {owner} с согласия "
+                        f"прокурора: запрет на совершение сделок, расходных операций по счетам, регистрационных "
+                        f"действий с имуществом")
+            restriction = {k: v for k, v in a.items() if k in ('направление', 'исполнитель', 'срок', 'статус',
+                                                               'очередность')}
+            restriction.update({
+                'действие': new_text,
+                'этап': stage,
+                'цель': "Не допустить сокрытия и отчуждения имущества до наложения на него ареста.",
+                'результат': "Распоряжение имуществом ограничено; далее — постановление о наложении ареста.",
+            })
+            print(f"  ➕ [ProceduralValidator] Добавлено временное ограничение перед арестом: '{new_text[:100]}'")
+            result.append(restriction)
+            if key.startswith('org:'):
+                covered_orgs.add(key[4:])
+            else:
+                covered_persons.add(key)
+        result.append(a)
+    return result
+
 
 def _chain_links(pending: List[Dict], figurants: str = '') -> tuple:
     """
@@ -1220,19 +2169,20 @@ def _chain_links(pending: List[Dict], figurants: str = '') -> tuple:
         return {p['key'] for p in find_person_mentions(normalize_text(a.get('действие', '')))}
 
     def _interviewee(a):
-        # Допрашиваемый — первое лицо в пункте: «Допросить Раздыкову Г.М. о назначении Байдильдиной А.Е.» — Раздыкова
+        # Допрашиваемый — первое лицо в пункте: «Допросить Андрееву Г.М. о назначении Орловой А.Е.» — Андреева
         found = find_person_mentions(normalize_text(a.get('действие', '')))
         return found[0]['key'] if found else None
 
     def _suspect_interview(a):
-        text = normalize_text(a.get('действие', ''))
-        found = find_person_mentions(text)
-        head = text[:found[0]['start']] if found else text
-        return (found and found[0]['key'] in figurant_keys) or bool(
-            re.search(r'подозреваем|обвиняем', head, re.IGNORECASE)
-            or re.search(r'в\s+качестве\s+(?:подозреваем|обвиняем)', text, re.IGNORECASE))
+        # «Допросить свидетеля Васильева …» — допрос свидетеля, хотя Васильев фигурант: он не ждёт осмотров
+        # и вещдоков и не выходит за срок этапа допросов свидетелей (216, дозагрузка)
+        return _suspect_interviewee(a.get('действие', ''), figurant_keys) is not None
 
-    by_step['допрос_подозреваемого'] = [a for a in by_step.get('допрос', []) if _suspect_interview(a)]
+    # Первоначальный допрос подозреваемого — после обыска (выемки) у него, а не после всей документальной базы;
+    # допрос по существу (по противоречиям) — после осмотра изъятого, вещдоков и первоначального допроса
+    suspects = [a for a in by_step.get('допрос', []) if _suspect_interview(a)]
+    by_step['первоначальный_допрос'] = [a for a in suspects if _INITIAL_INTERVIEW.search(a.get('действие', ''))]
+    by_step['допрос_подозреваемого'] = [a for a in suspects if not _INITIAL_INTERVIEW.search(a.get('действие', ''))]
 
     def _participant(p, act):
         # очная ставка — после допросов обоих участников («между X и Y»); проверка показаний — после допроса лица
@@ -1252,16 +2202,37 @@ def _chain_links(pending: List[Dict], figurants: str = '') -> tuple:
         pa, pb = _persons(a), _persons(b)
         return not pa or not pb or bool(pa & pb)
 
+    def _own_search(p, act):
+        # Обыск «в частном доме по адресу …» лица не называет — лицо берётся и из санкции этого обыска
+        names = _persons(p) | {k for s in preds.get(id(p), []) for k in _persons(s)}
+        return _interviewee(act) in names
+
+    def _same_interviewee(p, act):
+        return _interviewee(p) == _interviewee(act)
+
     def _source(a):
         m = re.search(r'по\s+запросу\s+из\s+(.+?)(?:\s*\(|[.;]|$)', a.get('действие', ''), re.IGNORECASE)
         return m.group(1).strip().lower() if m else None
 
+    request_ids = [_request_identity(r.get('действие', '')) for r in by_step.get('запрос', [])]
+
     def _same_req(a, b):
         # Автодобавленные «Истребовать …» и «Произвести осмотр …» по запросу из одного органа: в осмотре нет
         # предмета и лица запроса, поэтому связь — по адресату «по запросу из …»
+        ia, ib = _request_identity(a.get('действие', '')), _request_identity(b.get('действие', ''))
         if _source(a) and _source(a) == _source(b):
+            # тот же адресат, но разные ТОО в предмете («… ТОО «А» …» и «… ТОО «Б» …») — разные запросы (216 v11)
+            sa, sb = ia.get('subj_orgs', set()), ib.get('subj_orgs', set())
+            if not (sa and sb and not (sa & sb)):
+                return True
+        if _same_request(ia, ib):
             return True
-        return _same_request(_request_identity(a.get('действие', '')), _request_identity(b.get('действие', '')))
+        # Единственный запрос к этому адресату: его истребование / осмотр ответа без лиц (текст автопункта обрезан —
+        # «(сведений о наличии имущества, кредитов…)») относятся к нему, как и при их добавлении (_answers_request)
+        if _chain_step(a.get('действие', '').lower()) == 'запрос':
+            sole = sum(_same_addressee(ia, other) for other in request_ids) <= 1
+            return _answers_request(ia, b.get('действие', ''), sole)
+        return False
 
     # (шаг, предыдущие шаги, условие связи)
     chain = [
@@ -1272,15 +2243,19 @@ def _chain_links(pending: List[Dict], figurants: str = '') -> tuple:
         ('назначение_экспертизы', ('выемка', 'обыск'), _same_object),
         ('истребование', ('запрос',), _same_req),
         ('осмотр_сведений', ('истребование', 'запрос'), _same_req),
+        ('арест', ('ограничение',), _same_person),
         ('санкция_ареста', ('арест',), _same_person),
+        ('первоначальный_допрос', ('обыск', 'выемка'), _own_search),
         ('допрос_подозреваемого', ('осмотр_изъятого', 'вещдок'), None),
+        ('допрос_подозреваемого', ('первоначальный_допрос',), _same_interviewee),
         ('очная_ставка', ('допрос',), _participant),
         ('проверка_показаний', ('допрос',), _participant),
     ]
     order, preds = [], {}
     for step, prev_steps, linked in chain:
         acts = by_step.get(step, [])
-        order.append((step, acts))
+        if all(s != step for s, _a in order):  # шаг с двумя видами предыдущих шагов — в порядке один раз
+            order.append((step, acts))
         for act in acts:
             preds.setdefault(id(act), []).extend(
                 p for s in prev_steps for p in by_step.get(s, []) if p is not act and (linked is None or linked(p, act)))
@@ -1347,9 +2322,157 @@ def _int_field(value) -> Optional[int]:
     return int(m.group(0)) if m else None
 
 
-def distribute_by_days(actions: List[Dict], base_date, figurants: str = '', stage_limits: Optional[Dict] = None,
-                       movable: Optional[List[Dict]] = None, per_day: int = ACTIONS_PER_DAY) -> List[Dict]:
+# «Санкционировано постановление …», «Санкционировать …», «Ходатайствовать … о санкционировании …», «Вынести
+# постановление о производстве обыска (выемки) … и … ходатайствовать … о его санкционировании»
+_SANCTION_ITEM = re.compile(
+    r'\s*(?:\d+[.)]\s*)?(?:санкционир\w*|ходатайств\w*[^.;]{0,120}?санкционир'
+    r'|вынести\s+постановлени\w*\s+о\s+производстве\s+(?:обыска|выемки)[^;]*?санкционир)', re.IGNORECASE)
+
+
+def counts_in_daily_norm(a: Dict) -> bool:
     """
+    Пункт входит в норму «не более 3 действий в день». Санкции (на обыск, выемку, банковские сведения, арест) — нет
+    (автор методики, 07.11.2026: «Да, не учитывать»): это решение судьи по ходатайству, а не отдельное следственное
+    действие. Свой день они получают как обычно: по очереди и до своего действия по цепочке.
+    Постановление о наложении ареста «… и ходатайствовать о его санкционировании» — само действие, в норму входит.
+    """
+    t = a.get('действие', '') or ''
+    if _chain_step(t.lower()) in ('санкция', 'санкция_ареста'):
+        return False
+    return not _SANCTION_ITEM.match(t)
+
+
+def _own_stage_limit(x: Dict, limits: Dict, inspection_stage=None):
+    """Предел этапа самого пункта (без следующих шагов цепочки) — как в distribute_by_days."""
+    step = _chain_step(x.get('действие', '').lower())
+    if step == 'истребование':
+        return None
+    if step in ('осмотр_сведений', 'осмотр_изъятого', 'вещдок'):
+        return limits.get(_int_field(inspection_stage)) if inspection_stage is not None else None
+    return limits.get(_int_field(x.get('этап')))
+
+
+def _relative_cap(x: Dict, day_of: Dict, preds: Dict, relative_limits: Optional[Dict]):
+    """
+    Предел «до N суток после …» (относительный срок этапа методики, {этап: N}): день самого позднего предыдущего шага
+    цепочки пункта + N; без расставленных предыдущих шагов или без такого срока у этапа — None.
+    """
+    n = (relative_limits or {}).get(_int_field(x.get('этап')))
+    if n is None:
+        return None
+    days = [day_of[id(p)] for p in preds.get(id(x), []) if id(p) in day_of]
+    return max(days) + n if days else None
+
+
+def _repair_overload(pending, day_of, load, preds, succ, todo_ids, limits, inspection_stage, per_day, base_date,
+                     relative_limits=None):
+    """
+    Второй проход расстановки: день сверх per_day разгружается цепочкой переносов — пункт с этого дня на другой,
+    оттуда другой пункт дальше …, пока последний не встанет на день со свободным местом (16.11 в 216 v5: пять пунктов
+    этапа 9 на последнем дне этапа, хотя пункты со сроком 15–30 суток могли уйти позже). Каждый перенос — в
+    пределах срока этапа пункта (уже стоящий позже срока по цепочке — не позже своего дня) и не раньше предыдущих /
+    не позже следующих шагов его цепочки. Не переносятся обязательные первые пункты, исполненные и заблокированные.
+    Ранее запланированные пункты (при дозагрузке) переносятся, только если без них день не разгрузить.
+    -> (сколько убрано пунктов сверх нормы, сколько из переносов — ранее запланированные пункты)
+    """
+    from collections import deque
+    from datetime import timedelta
+    by_id = {id(x): x for x in pending}
+    horizon = max(list(day_of.values()) + [1]) + 30
+
+    def movable(x, allow_old):
+        # санкция места в норме дня не занимает — её перенос день не разгружает
+        return id(x) in day_of and not _is_mandatory(x) and not x.get('статус_заблокирован') \
+            and counts_in_daily_norm(x) and (id(x) in todo_ids or allow_old)
+
+    def window(x):
+        d = day_of[id(x)]
+        lo = max([day_of[id(p)] + CHAIN_GAP_DAYS for p in preds.get(id(x), []) if id(p) in day_of] + [1])
+        hi = min([day_of[id(s)] - CHAIN_GAP_DAYS for s in succ.get(id(x), []) if id(s) in day_of] + [horizon])
+        lim = _own_stage_limit(x, limits, inspection_stage)
+        if lim is not None:
+            hi = min(hi, max(lim, 1, d))  # позже срока этапа — нельзя; уже стоящий позже — не дальше своего дня
+        rel = _relative_cap(x, day_of, preds, relative_limits)
+        if rel is not None:
+            hi = min(hi, max(rel, d))  # «до N суток после …» — от предыдущего шага цепочки
+        return lo, hi
+
+    def augment(d0, allow_old):
+        """Кратчайшая цепочка переносов с дня d0 на день со свободным местом: [(пункт, с дня, на день)…]."""
+        prev = {d0: None}
+        q = deque([d0])
+        while q:
+            u = q.popleft()
+            items = [x for x in pending if day_of.get(id(x)) == u and movable(x, allow_old)]
+            items.sort(key=lambda x: id(x) not in todo_ids)  # сначала новые пункты
+            for x in items:
+                lo, hi = window(x)
+                for v in sorted(range(lo, hi + 1), key=lambda v: (abs(v - u), v)):
+                    if v == u or v in prev:
+                        continue
+                    prev[v] = (u, x)
+                    if load.get(v, 0) < per_day:
+                        path, w = [], v
+                        while prev[w] is not None:
+                            pu, px = prev[w]
+                            path.append((px, pu, w))
+                            w = pu
+                        return path[::-1]
+                    q.append(v)
+        return None
+
+    def valid(x, over_before):
+        d = day_of[id(x)]
+
+        def rel_ok(y):
+            # «до N суток после …» не нарушается переносом (стоявший за сроком и до переноса — не хуже, чем было)
+            cap = _relative_cap(y, day_of, preds, relative_limits)
+            return cap is None or day_of[id(y)] <= cap or id(y) in over_before
+
+        return all(day_of[id(p)] + CHAIN_GAP_DAYS <= d for p in preds.get(id(x), []) if id(p) in day_of) \
+            and all(d + CHAIN_GAP_DAYS <= day_of[id(s)] for s in succ.get(id(x), []) if id(s) in day_of) \
+            and rel_ok(x) and all(rel_ok(s) for s in succ.get(id(x), []) if id(s) in day_of)
+
+    repaired, moved_old = 0, 0
+    stuck = set()
+    for _ in range(1000):
+        over = sorted(d for d, n in load.items() if n > per_day and d not in stuck)
+        if not over:
+            break
+        d0 = over[0]
+        path = augment(d0, allow_old=False) or augment(d0, allow_old=True)
+        if not path:
+            stuck.add(d0)
+            continue
+        # пункты, уже стоявшие за относительным сроком до переноса (их перенос хуже не делает)
+        touched = [x for x, _u, _v in path] + [s for x, _u, _v in path for s in succ.get(id(x), []) if id(s) in day_of]
+        over_before = {id(y) for y in touched if _relative_cap(y, day_of, preds, relative_limits) is not None
+                       and day_of[id(y)] > _relative_cap(y, day_of, preds, relative_limits)}
+        for x, u, v in path:
+            day_of[id(x)] = v
+            load[u] -= 1
+            load[v] = load.get(v, 0) + 1
+        if not all(valid(x, over_before) for x, _u, _v in path):
+            for x, u, v in reversed(path):  # цепочка задела связанные пункты — откат, день оставляем как есть
+                day_of[id(x)] = u
+                load[v] -= 1
+                load[u] += 1
+            stuck.add(d0)
+            continue
+        for x, _u, v in path:
+            x['срок'] = (base_date + timedelta(days=v)).strftime('%d.%m.%Y')
+            moved_old += id(x) not in todo_ids
+        repaired += 1
+    return repaired, moved_old
+
+
+def distribute_by_days(actions: List[Dict], base_date, figurants: str = '', stage_limits: Optional[Dict] = None,
+                       movable: Optional[List[Dict]] = None, per_day: int = ACTIONS_PER_DAY,
+                       inspection_stage=None, relative_limits: Optional[Dict] = None) -> List[Dict]:
+    """
+    По методике (автор, 05.11.2026) срок этапа запроса — срок на отправку запроса: у истребования своего предела
+    нет, осмотр полученных сведений — в пределах этапа «Осмотры» (inspection_stage — его номер в методике дела;
+    None — без предела). Этап, поставленный такому пункту моделью или прежним кодом, предел не задаёт.
     Расставляет сроки по дням: в порядке «очередности», заданной моделью (обязательные первые три пункта — первыми),
     не более per_day действий в день, следующий шаг цепочки — не раньше чем через CHAIN_GAP_DAYS после предыдущего.
     Срок этапа методики («Этап 9. Допросы (срок: до 9 суток)», stage_limits = {9: 9}) — граница: если дней не хватает,
@@ -1364,6 +2487,8 @@ def distribute_by_days(actions: List[Dict], base_date, figurants: str = '', stag
     movable_ids = {id(a) for a in movable} if movable is not None else None
     _order, preds = _chain_links(pending, figurants)
     limits = {int(k): int(v) for k, v in (stage_limits or {}).items()}
+    # «до N суток после …» (арест — после ограничения): от предыдущего шага цепочки пункта
+    rel_limits = {int(k): int(v) for k, v in (relative_limits or {}).items()}
 
     load, day_of = {}, {}
     todo = []
@@ -1372,7 +2497,8 @@ def distribute_by_days(actions: List[Dict], base_date, figurants: str = '', stag
             d = _deadline(a)
             if d is not None:
                 day_of[id(a)] = (d - base_date).days
-                load[day_of[id(a)]] = load.get(day_of[id(a)], 0) + 1
+                if counts_in_daily_norm(a):
+                    load[day_of[id(a)]] = load.get(day_of[id(a)], 0) + 1
         else:
             todo.append(a)
 
@@ -1404,7 +2530,16 @@ def distribute_by_days(actions: List[Dict], base_date, figurants: str = '', stag
         """
         if id(x) in eff_limits:
             return eff_limits[id(x)]
-        lim = limits.get(_int_field(x.get('этап')))
+        step = _chain_step(x.get('действие', '').lower())
+        if step == 'истребование':
+            lim = None
+        elif step in ('осмотр_сведений', 'осмотр_изъятого', 'вещдок'):
+            # этап «Осмотры» методики: «Осмотр изъятого и полученных сведений; признание изъятого вещественными
+            # доказательствами» (Порядок, п. 15 — не более 1 месяца). Этап, поставленный моделью (в 216 v3 вещдоку —
+            # «этап 1», 3 суток), не стягивает всю цепочку выемки в первый день
+            lim = limits.get(_int_field(inspection_stage)) if inspection_stage is not None else None
+        else:
+            lim = limits.get(_int_field(x.get('этап')))
         for s in succ.get(id(x), []):
             if id(s) in todo_ids and id(s) not in seen:
                 s_lim = _limit_of(s, seen + (id(x),))
@@ -1421,9 +2556,11 @@ def distribute_by_days(actions: List[Dict], base_date, figurants: str = '', stag
         """
         a_preds = {id(p) for p in preds.get(id(a), [])}
         for y in range(hi, lo - 1, -1):
-            on_day = [x for x in placed if day_of[id(x)] == y and not _is_mandatory(x) and id(x) not in a_preds]
+            on_day = [x for x in placed if day_of[id(x)] == y and not _is_mandatory(x) and id(x) not in a_preds
+                      and counts_in_daily_norm(x)]
             for x in sorted(on_day, key=lambda x: -(_limit_of(x) if _limit_of(x) is not None else 10 ** 6)):
-                top = min([_limit_of(x) if _limit_of(x) is not None else 10 ** 6] +
+                rel_x = _relative_cap(x, day_of, preds, rel_limits)
+                top = min([_limit_of(x) if _limit_of(x) is not None else 10 ** 6] + ([rel_x] if rel_x is not None else []) +
                           [day_of[id(s)] - CHAIN_GAP_DAYS for s in succ.get(id(x), []) if id(s) in day_of])
                 z = y + 1
                 while z <= top and load.get(z, 0) >= per_day:
@@ -1452,9 +2589,19 @@ def distribute_by_days(actions: List[Dict], base_date, figurants: str = '', stag
         a = remaining.pop(pick)
         chain_lower = max([day_of[id(p)] + CHAIN_GAP_DAYS for p in preds.get(id(a), []) if id(p) in day_of] + [1])
         limit = _limit_of(a)
+        rel = _relative_cap(a, day_of, preds, rel_limits)
+        if rel is not None:
+            limit = rel if limit is None else min(limit, rel)
         if limit is not None:
             limit = max(limit, 1)
         lower = max(chain_lower, seq_day)
+        if not counts_in_daily_norm(a):
+            # Санкция в норму дня не входит (автор, 07.11.2026): день — по очереди и цепочке, не позже срока, если можно
+            d = chain_lower if limit is not None and lower > limit else lower
+            day_of[id(a)] = d
+            a['срок'] = (base_date + timedelta(days=d)).strftime('%d.%m.%Y')
+            placed.append(a)
+            continue
         if limit is not None and chain_lower > limit:
             # предыдущий шаг цепочки сам на пределе этапа — ближайший свободный день после него
             d = chain_lower
@@ -1467,7 +2614,10 @@ def distribute_by_days(actions: List[Dict], base_date, figurants: str = '', stag
             d = lower
             while load.get(d, 0) >= per_day and (limit is None or d < limit):
                 d += 1
-            seq_day = d
+            # Пункт, отложенный только своей цепочкой (арест — на день после ограничения), очередь не двигает:
+            # иначе дни до него оставались недогруженными, а пункты со сроком этапа сходились в его последний день
+            if chain_lower <= seq_day:
+                seq_day = d
         if load.get(d, 0) >= per_day:
             # день на пределе этапа уже заполнен — сначала переносим пункт, у которого есть запас по сроку,
             # и только если такого нет, ставим сверх нормы
@@ -1484,12 +2634,18 @@ def distribute_by_days(actions: List[Dict], base_date, figurants: str = '', stag
         load[d] = load.get(d, 0) + 1
         a['срок'] = (base_date + timedelta(days=d)).strftime('%d.%m.%Y')
         placed.append(a)
+
+    repaired, moved_old = _repair_overload(pending, day_of, load, preds, succ, todo_ids, limits, inspection_stage,
+                                           per_day, base_date, relative_limits=rel_limits)
     if displaced:
         print(f"  📅 [Сроки] Перенесено пунктов с запасом по сроку этапа (чтобы не превышать {per_day} в день): {displaced}")
+    if repaired:
+        print(f"  📅 [Сроки] Убрано пунктов сверх {per_day} в день переносами в пределах сроков этапов: {repaired}"
+              + (f" (в том числе сдвинуто ранее запланированных пунктов: {moved_old})" if moved_old else ''))
     if todo:
         last = max(day_of[id(a)] for a in todo)
-        print(f"  📅 [Сроки] Пункты расставлены по дням ({len(todo)}): не более {per_day} в день, "
-              f"последний — {(base_date + timedelta(days=last)).strftime('%d.%m.%Y')}")
+        print(f"  📅 [Сроки] Пункты расставлены по дням ({len(todo)}): не более {per_day} в день "
+              f"(санкции в норму не входят), последний — {(base_date + timedelta(days=last)).strftime('%d.%m.%Y')}")
     return actions
 
 
@@ -1534,11 +2690,34 @@ def deduplicate_semantic(actions: List[Dict]) -> List[Dict]:
             # допрашиваемого или «в качестве …» сразу после, а не из предмета допроса
             from core.conducted_actions import _action_role
             status = _action_role(text.lower(), mentions)  # позиции ФИО — по исходному тексту
+            # Первоначальный допрос подозреваемого и допрос по существу — разные действия
+            if _INITIAL_INTERVIEW.search(t_lower):
+                status = (status, 'первоначальный')
             keys += [('допрос', status, p) for p in persons] if len(persons) == 1 else [('допрос', status, persons)]
         elif re.search(r'очн\w*\s+ставк', t_lower) and persons:
             keys.append(('очная', persons))
         elif re.match(r'\s*(?:произвести|провести)?\s*осмотр', t_lower):
-            keys.append(('осмотр', persons, _object_stems(t_lower, skip=0)))
+            # осмотр ответа: первые слова у всех одинаковые («полученных сведений по запросу из Комитета
+            # государственных доходов») — предмет идёт дальше, поэтому слов берётся больше
+            n_words = 12 if _chain_step(t_lower) == 'осмотр_сведений' else 6
+            keys.append(('осмотр', persons, _object_stems(t_lower, skip=0, n=n_words)))
+        elif re.search(_ARREST_RE, t_lower) and re.search(r'ходатайств', t_lower):
+            # «Вынести постановление об аресте имущества X и ходатайствовать о санкционировании» уже содержит
+            # ходатайство: второй такой пункт по X («Санкционировать постановление об аресте … и ходатайствовать»)
+            # — дубль. Отдельный пункт-постановление без ходатайства не трогается
+            keys.append(('арест_с_ходатайством', persons))
+        elif _chain_step(t_lower) == 'ограничение' and persons:
+            # второе ограничение имущества того же лица — дубль (другие лица — свои пункты); лицо, уже названное в
+            # общем ограничении («… имуществом каждого подозреваемого: Иванова А.Б., …»), — тоже (216, дозагрузка).
+            # Пункт, где есть и новые лица, остаётся
+            if all(('ограничение', p) in seen for p in persons):
+                print(f"  ✂ [ProceduralValidator] Удалён смысловой дубль: '{text[:70]}...'")
+                continue
+            seen.update(('ограничение', p) for p in persons)
+        elif _chain_step(t_lower) == 'вещдок':
+            # вещдоки того же объекта — по словам после «вещественных доказательств»
+            obj = re.split(r'доказательств\w*', t_lower, maxsplit=1)[-1]
+            keys.append(('вещдок', persons, _object_stems(obj, skip=0)))
 
         if any(k in seen for k in keys):
             print(f"  ✂ [ProceduralValidator] Удалён смысловой дубль: '{text[:70]}...'")
@@ -1593,8 +2772,60 @@ _ANSWER_AS_EVIDENCE = re.compile(
     r'|признани\w*\s+(?:полученн\w+\s+)?(?:ответ|сведени)\w*[^.;]{0,120}?вещественн\w*\s+доказательств', re.IGNORECASE)
 
 
+# Источник — ответ на запрос (автор, 05.11.2026: «убирать»): «…полученных из КГД выписок ЭСФ», «…выписок,
+# полученных через СИО ПСО», «выписки из БД СИО ПСО». Изъятое при выемке/обыске и добровольно выданное — вещдоки
+_ANSWER_SOURCE = re.compile(
+    r'полученн\w*\s+(?:по\s+запрос|в\s+ответ|из\s|от\s|через\s|посредством\s)'
+    r'|(?:выписк|сведени|данн)\w*\s+(?:из\s+)?(?:бд\s+|баз\w*\s+данных\s+)?«?сио\s*псо', re.IGNORECASE)
+_SEIZED_SOURCE = re.compile(r'изъят|выемк|обыск|добровольн|выдан', re.IGNORECASE)
+
+
+# «Признать вещественным доказательством заключение специалиста (эксперта)» — заключение эксперта и специалиста —
+# самостоятельный вид доказательств, а не вещественное доказательство (216 v5)
+_OPINION_AS_EVIDENCE = re.compile(
+    r'(?:вещественн\w*\s+доказательств\w*|вещдок\w*)\s+(?:\w+\s+){0,2}?заключени\w*\s+(?:судебн\w+\s+)?(?:специалист|эксперт)'
+    r'|заключени\w*\s+(?:судебн\w+\s+)?(?:специалист|эксперт)\w*[^.;]{0,80}?(?:в\s+качестве\s+)?вещественн\w*\s+доказательств'
+    # «…вещественных доказательств результатов компьютерно-технической и судебно-экономической экспертиз» (216 v6)
+    r'|(?:вещественн\w*\s+доказательств\w*|вещдок\w*)\s+(?:\w+\s+){0,2}?(?:результат|вывод)\w*\s+[^.;]{0,80}?экспертиз',
+    re.IGNORECASE)
+
+
 def is_answer_as_material_evidence(text: str) -> bool:
-    return bool(_ANSWER_AS_EVIDENCE.search(text or ''))
+    t = text or ''
+    if _ANSWER_AS_EVIDENCE.search(t) or _OPINION_AS_EVIDENCE.search(t):
+        return True
+    return bool(re.search(r'вещественн\w*\s+доказательств|вещдок', t, re.IGNORECASE)
+                and _ANSWER_SOURCE.search(t) and not _SEIZED_SOURCE.search(t))
+
+
+def drop_answer_evidence(actions: List[Dict], context: Optional[List[Dict]] = None) -> List[Dict]:
+    """
+    Вещдоками не признаются ответы на запросы (автор, 05.11.2026). Кроме явных формулировок
+    (is_answer_as_material_evidence) — пункт без указания источника («…банковских выписок по счёту Иванова»,
+    «…регистрационных дел на недвижимость»), если в плане этот же предмет осматривается как полученный по
+    запросу («Произвести осмотр полученных …») и нет ни санкции, ни выемки, ни обыска, ни осмотра изъятого того же
+    предмета. context — пункты, уже стоящие в плане (при дозагрузке). Исполненные пункты не трогаются.
+    """
+    pool = list(context or []) + list(actions)
+    result = []
+    for a in actions:
+        text = a.get('действие', '') or ''
+        t = text.lower()
+        if a.get('статус') != 'Исполнен' and _chain_step(t) == 'вещдок' and not _SEIZED_SOURCE.search(t):
+            if is_answer_as_material_evidence(text):
+                print(f"  ✂ [ProceduralValidator] Ответ на запрос — иной документ, не вещественное доказательство: "
+                      f"'{text[:90]}...'")
+                continue
+            same = [x for x in pool if x is not a and _same_object(x, a)]
+            received = [x for x in same if _chain_step(x.get('действие', '').lower()) == 'осмотр_сведений']
+            seized = [x for x in same
+                      if _chain_step(x.get('действие', '').lower()) in ('санкция', 'выемка', 'обыск', 'осмотр_изъятого')]
+            if received and not seized:
+                print(f"  ✂ [ProceduralValidator] Вещдок из ответа на запрос (предмет осматривается как полученный "
+                      f"по запросу, выемки нет): '{text[:90]}...'")
+                continue
+        result.append(a)
+    return result
 
 
 def validate_and_order_actions(actions: List[Dict], case_data: Optional[Dict] = None) -> List[Dict]:
@@ -1624,6 +2855,12 @@ def validate_and_order_actions(actions: List[Dict], case_data: Optional[Dict] = 
         if is_forbidden_search_of_witness_or_victim(text):
             continue
 
+        # 1г. «Место жительства» — офис (216 v7: «обыск по месту жительства Морозова: … БЦ «Центр», кабинет 18 (офис
+        #     ТОО …)» — тот же офис, что изымается выемкой): санкция, обыск и осмотр изъятого «из места жительства»
+        if act.get('статус') != 'Исполнен' and is_office_as_residence(text):
+            print(f"  ✂ [ProceduralValidator] По месту жительства указан офис — пункт удалён: '{text[:110]}...'")
+            continue
+
         # 1в. Ответы на запросы — иные документы, вещественными доказательствами не признаются
         if is_answer_as_material_evidence(text) and act.get('статус') != 'Исполнен':
             print(f"  ✂ [ProceduralValidator] Ответ на запрос — иной документ, не вещественное доказательство: '{text[:70]}...'")
@@ -1641,8 +2878,12 @@ def validate_and_order_actions(actions: List[Dict], case_data: Optional[Dict] = 
         # 5. Исправление нереалистичных целей для СИО ПСО
         act = fix_sio_pso_goal(act)
 
-        # 6. Простейшая дедупликация идентичных текстов
-        sig = act['действие'][:80].strip().lower()
+        # 6. Простейшая дедупликация идентичных текстов — по всему тексту. По первым 80 символам совпадали разные
+        #    пункты («Вынести постановление о временном ограничении распоряжения имуществом подозреваемого …»,
+        #    «… о признании в качестве вещественных доказательств изъятых …»): в 216 v1–v6 так удалялись
+        #    ограничения, вещдоки, истребования и осмотры других лиц и объектов. Смысловые повторы убирают
+        #    дальнейшие шаги (запросы, санкции, допросы, осмотры, ограничения, вещдоки)
+        sig = re.sub(r'\s+', ' ', act['действие'].lower()).strip(' .,;')
         if sig in seen_signatures:
             print(f"  ✂ [ProceduralValidator] Удален дубликат действия: '{text[:60]}...'")
             continue
@@ -1658,9 +2899,16 @@ def validate_and_order_actions(actions: List[Dict], case_data: Optional[Dict] = 
 
     # 9. Гарантия наличия санкционирования перед КАЖДОЙ выемкой/обыском
     validated_actions = ensure_sanction_before_every_seizure(validated_actions, case_data=case_data)
+    # 9а. Повторная санкция на тот же адрес — одна; 9б. каждой санкции — её обыск (выемка)
+    validated_actions = dedupe_sanctions(validated_actions)
+    # 9а-1. Банковские санкции (выемки) по разным владельцам счетов одного вида — один пункт
+    validated_actions = merge_per_person_bank_items(validated_actions)
+    validated_actions = ensure_execution_after_sanction(validated_actions, case_data=case_data)
 
     # 10. Гарантия наличия пошаговой цепочки запросов (Направить запрос -> Истребовать сведения -> Произвести осмотр полученных сведений)
     #     Сначала убираем запросы в СИО ПСО и повторные запросы, чтобы не строить для них цепочки
+    #     Адресат, явно противоречащий предмету запроса («Пенсионный фонд (ПКБ) о кредитах»), — по компетенции
+    validated_actions = fix_request_addressee(validated_actions)
     validated_actions = deduplicate_requests(validated_actions)
     validated_actions = ensure_request_inspection_followups(validated_actions, case_data=case_data)
 
@@ -1670,10 +2918,22 @@ def validate_and_order_actions(actions: List[Dict], case_data: Optional[Dict] = 
     # 11. Фиксация базовой цепочки выемки/обыска (Санкционировано -> Произвести -> Осмотр изъятых предметов и документов -> Постановление о признании вещдоком)
     validated_actions = fix_seizure_and_evidence_chain(validated_actions, case_data=case_data)
 
+    # 11-1. Ответы на запросы вещдоками не признаются (и без слова «ответ»: предмет — полученный по запросу)
+    validated_actions = drop_answer_evidence(validated_actions)
+
     # 11а. Смысловая дедупликация (повторные допросы/осмотры, одинаковые автодобавленные пункты)
     validated_actions = deduplicate_semantic(validated_actions)
 
-    # 12. Единообразное заполнение исполнителя (ФИО) и срока (ДД.ММ.ГГГГ) для всех действий
+    # 11б. Первоначальный допрос каждого подозреваемого (если в плане только допрос по существу)
+    validated_actions = ensure_initial_suspect_interview(validated_actions, case_data=case_data)
+
+    # 11б-1. Допрос свидетелем лица, которое в плане допрашивается как подозреваемый, — лишний
+    validated_actions = drop_witness_interview_of_suspect(validated_actions, case_data=case_data)
+
+    # 11в. Временное ограничение распоряжения имуществом — перед каждым арестом, если модель его пропустила
+    validated_actions = ensure_restriction_before_arrest(validated_actions, case_data=case_data)
+
+    # 12.Единообразное заполнение исполнителя (ФИО) и срока (ДД.ММ.ГГГГ) для всех действий
     fio, default_srok = _extract_investigator_and_deadline(case_data)
     for act in validated_actions:
         if not act.get('исполнитель') or act['исполнитель'] in ('Следователь', 'Н/Д', ''):
