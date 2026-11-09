@@ -383,8 +383,12 @@ def _clean_action_texts(action: dict, case_data: dict) -> None:
     # ── Убираем автонумерацию LLM (5.3.1., 1), 2. и т.п.) из начала текста ──
     action['действие'] = re.sub(r'^\s*\d+(?:\.\d+)*\.?\s*[).]?\s*', '', action['действие']).strip()
     # ── «Проверка показаний посредством очной ставки» — это очная ставка между участниками ──
-    from core.procedural_validator import fix_confrontation_wording, fix_suspect_gender
+    from core.procedural_validator import fix_confrontation_wording, fix_suspect_gender, fix_sanction_tense
     action['действие'] = fix_confrontation_wording(action['действие'])
+    # «Санкционировано постановление о производстве выемки …» у неисполненного пункта — «Вынести постановление … и в
+    # установленном порядке ходатайствовать перед следственным судьей о его санкционировании»
+    if action.get('статус') != 'Исполнен':
+        action['действие'] = fix_sanction_tense(action['действие'])
     # «подозреваемого Петрову» — род по полу лица из материалов дела
     action['действие'] = fix_suspect_gender(action['действие'], case_data)
     action['цель'] = re.sub(r'^\s*\d+(?:\.\d+)*\.?\s*[).]?\s*', '', action['цель']).strip()
@@ -1920,6 +1924,27 @@ def _append_sanctions(new_actions: list, existing: list, case_data: dict) -> lis
     return [x for x in out if id(x) in new_ids or id(x) in added]
 
 
+def _reword_plan_sanctions(actions: list) -> int:
+    """
+    Прежние неисполненные пункты плана при дозагрузке: «Санкционировано (Санкционировать) постановление …» ->
+    «Вынести постановление … и в установленном порядке ходатайствовать … о его санкционировании», как у новых
+    пунктов (автор, 09.11.2026: «Да, переписывать»). Меняется только текст: срок, очередность, этап и статус
+    прежние. Исполненные пункты — отметка о факте, не меняются.
+    """
+    from core.procedural_validator import fix_sanction_tense
+    n = 0
+    for a in actions:
+        t = a.get('действие', '') or ''
+        if a.get('статус') != 'Исполнен' and t:
+            new = fix_sanction_tense(t)
+            if new != t:
+                a['действие'] = new
+                n += 1
+    if n:
+        print(f"  ✎ [Дозагрузка] Формулировка санкций в прежних пунктах плана исправлена: {n}")
+    return n
+
+
 def _filter_append_actions(new_actions: list, plan: dict, new_docs: list, retrieved_context: str,
                            new_conducted: list = None, sources: list = None) -> list:
     """
@@ -2446,6 +2471,8 @@ def append_documents_to_plan(plan_path, new_docs_paths=None,llm_client=None, met
     case_data = plan.get('case_data', {})
     processed_docs = plan.get('processed_docs', [])
     print(f"📝 Уже в плане: {len(existing_actions)} действий")
+    # Прежние неисполненные санкции — в формулировке новых пунктов (до сравнения новых пунктов с планом)
+    _reword_plan_sanctions(existing_actions)
 
     new_docs_to_index = []
     newly_processed = []
@@ -2673,7 +2700,9 @@ def generate_append_live_from_context(case_number: str, llm_client) -> dict:
     existing_actions = plan.get('actions', [])
     case_data = plan.get('case_data', {})
     processed_docs = plan.get('processed_docs', [])
-    
+    # Прежние неисполненные санкции — в формулировке новых пунктов (до сравнения новых пунктов с планом)
+    _reword_plan_sanctions(existing_actions)
+
     print("⭐ Запуск LLM-генерации новых действий в прямом эфире...")
     t0 = time.time()
     new_actions = llm_client.generate_append_actions(
