@@ -1657,6 +1657,9 @@ def save_plan_to_json(plan: dict, plans_dir: str = PLANS_DIR) -> str:
     os.makedirs(plans_dir, exist_ok=True)
     # Нормализуем статусы перед записью — поле 'статус' обязательно для каждого пункта
     plan = normalize_plan_statuses(plan)
+    # Отметка о достижении порога исполнения (уведомление руководству обновить план)
+    from core.plan_statistics import update_plan_notice
+    update_plan_notice(plan)
     номер_raw = plan.get('plan_title_info', {}).get('номер_дела', 'unknown')
     номер = sanitize_filename(номер_raw)
     filepath = os.path.join(plans_dir, f"{номер}.json")

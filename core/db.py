@@ -91,6 +91,26 @@ async def load_plan_from_db_async(case_number: str) -> Optional[Dict[str, Any]]:
         if conn:
             await conn.close()
 
+async def list_plans_from_db_async() -> Dict[str, Dict[str, Any]]:
+    """Asynchronously loads all investigation plans: {case_number: plan_data}."""
+    conn = None
+    plans = {}
+    try:
+        conn = await get_db_connection()
+        rows = await conn.fetch("SELECT case_number, plan_data FROM investigation_plans;")
+        for row in rows:
+            data = row['plan_data']
+            if isinstance(data, str):
+                data = json.loads(data)
+            if data:
+                plans[row['case_number']] = dict(data)
+    except Exception as e:
+        print(f"❌ [DB] Ошибка получения списка планов из PostgreSQL: {e}")
+    finally:
+        if conn:
+            await conn.close()
+    return plans
+
 async def fetch_documents_from_db_async(case_number: str) -> List[Dict[str, Any]]:
     """Asynchronously fetches all full documents stored for a case from the LightRAG table."""
     conn = None
@@ -136,6 +156,10 @@ def save_plan_to_db(case_number: str, plan_data: Dict[str, Any]):
 def load_plan_from_db(case_number: str) -> Optional[Dict[str, Any]]:
     """Synchronous wrapper to load the investigation plan from the database."""
     return run_sync(load_plan_from_db_async(case_number))
+
+def list_plans_from_db() -> Dict[str, Dict[str, Any]]:
+    """Synchronous wrapper to load all investigation plans from the database."""
+    return run_sync(list_plans_from_db_async())
 
 def fetch_documents_from_db(case_number: str) -> List[Dict[str, Any]]:
     """Synchronous wrapper to fetch documents for a case from the LightRAG PostgreSQL table."""
