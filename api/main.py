@@ -64,6 +64,30 @@ def _safe_upload_name(filename: Optional[str]) -> str:
     return name
 
 
+def _plan_response(plan: dict) -> dict:
+    """JSON плана для клиента: статусы, порядок пунктов и статистика исполнения на сегодня (plan['statistics'])."""
+    from core.plan_generator import normalize_plan_statuses
+    from core.plan_statistics import attach_statistics
+    return attach_statistics(normalize_plan_statuses(plan))
+
+
+def _load_saved_plan(case_number: str) -> Optional[dict]:
+    """Сохранённый план дела: из PostgreSQL, иначе из data/plans/{номер}.json; None — плана нет."""
+    from core.db import load_plan_from_db
+    from core.plan_generator import PLANS_DIR, sanitize_filename
+    plan = load_plan_from_db(case_number)
+    if plan:
+        return plan
+    plan_path = os.path.join(PLANS_DIR, f"{sanitize_filename(case_number)}.json")
+    if not os.path.exists(plan_path):
+        return None
+    try:
+        with open(plan_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка чтения плана: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from core.db import init_db
@@ -353,9 +377,8 @@ def api_generate_plan(
 
         # === ВЫБОР ФОРМАТА ОТВЕТА ===
         if response_format == "json":
-            from core.plan_generator import normalize_plan_statuses
-            return normalize_plan_statuses(investigation_plan)
-            
+            return _plan_response(investigation_plan)
+
         if response_format == "text":
             info = investigation_plan.get("plan_title_info", {})
             actions = investigation_plan.get("actions", [])
@@ -870,8 +893,7 @@ def api_update_status(
                 print("  ℹ В БД нет новых документов. Статусы не изменились.")
                 investigation_plan = plan_snapshot
                 if response_format == "json":
-                    from core.plan_generator import normalize_plan_statuses
-                    return normalize_plan_statuses(investigation_plan)
+                    return _plan_response(investigation_plan)
                 success = create_investigation_plan_doc(investigation_plan, output_docx_path)
                 if not success or not os.path.exists(output_docx_path):
                     raise HTTPException(status_code=500, detail="Ошибка при генерации документа Word.")
@@ -890,8 +912,7 @@ def api_update_status(
         )
 
         if response_format == "json":
-            from core.plan_generator import normalize_plan_statuses
-            return normalize_plan_statuses(investigation_plan)
+            return _plan_response(investigation_plan)
 
         success = create_investigation_plan_doc(investigation_plan, output_docx_path)
         if not success or not os.path.exists(output_docx_path):
@@ -1042,6 +1063,7 @@ def api_manual_status(case_number: str, req: ManualStatusRequest):
         f"(блокировка: {old_locked} → {new_locked})"
     )
 
+    from core.plan_statistics import plan_statistics
     return {
         "success": True,
         "case_number": case_number,
@@ -1049,6 +1071,7 @@ def api_manual_status(case_number: str, req: ManualStatusRequest):
         "old_status": old_status,
         "new_status": req.new_status,
         "locked": new_locked,
+        "statistics": plan_statistics(plan),
         "message": (
             f"Статус пункта №{req.action_number} изменён на '{req.new_status}'. "
             + ("ЛЛМ заблокирован от изменения этого пункта." if new_locked
@@ -1061,28 +1084,84 @@ def api_manual_status(case_number: str, req: ManualStatusRequest):
 def api_get_plan(case_number: str):
     """
     Возвращает текущий план расследования в формате JSON по номеру дела.
-    Включает статусы, флаги блокировки и историю изменений статусов.
+    Включает статусы, флаги блокировки, историю изменений статусов
+    и статистику исполнения на сегодня (поле statistics, см. GET /api/plan/{case_number}/statistics).
     """
     case_number = _safe_case_id(case_number)
-    from core.db import load_plan_from_db
-    plan = load_plan_from_db(case_number)
-    
+    plan = _load_saved_plan(case_number)
     if not plan:
-        from core.plan_generator import PLANS_DIR, sanitize_filename
-        plan_path = os.path.join(PLANS_DIR, f"{sanitize_filename(case_number)}.json")
-        if not os.path.exists(plan_path):
-            raise HTTPException(
-                status_code=404,
-                detail=f"План для дела №{case_number} не найден."
-            )
+        raise HTTPException(
+            status_code=404,
+            detail=f"План для дела №{case_number} не найден."
+        )
+    return _plan_response(plan)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Статистика исполнения плана и уведомления руководству
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/plan/{case_number}/statistics")
+def api_plan_statistics(case_number: str):
+    """
+    Статистика исполнения плана на сегодня (считается на сервере при каждом запросе):
+      - total — всего пунктов; executed — «Исполнен»;
+      - overdue — не исполнен и срок прошёл; in_progress — не исполнен, срок не наступил;
+      - percent_executed — доля исполненных, %;
+      - plan_update_required — true, если исполнено не меньше порога (PLAN_UPDATE_THRESHOLD, по умолчанию 70 %):
+        руководству показывается уведомление «нужно обновить план»;
+      - update_required_since — когда порог был достигнут (при сохранении плана);
+      - overdue_numbers — номера просроченных пунктов.
+    """
+    case_number = _safe_case_id(case_number)
+    plan = _load_saved_plan(case_number)
+    if not plan:
+        raise HTTPException(status_code=404, detail=f"План для дела №{case_number} не найден.")
+    stats = _plan_response(plan)["statistics"]
+    return {"case_number": case_number, **stats}
+
+
+@app.get("/api/notifications/plan_update")
+def api_plan_update_notifications():
+    """
+    Уведомления руководству: дела, план по которым исполнен на порог и более (по умолчанию 70 %)
+    и должен быть обновлён. Дело уходит из списка, когда после дозагрузки новых пунктов
+    доля исполненных стала ниже порога.
+    Кто из руководителей курирует дело, сервис не знает — фильтрация по руководителю на стороне фронта.
+    """
+    import glob
+    from core.db import list_plans_from_db
+    from core.plan_generator import PLANS_DIR
+    from core.plan_statistics import main_executor, update_threshold_percent
+
+    plans = list_plans_from_db()
+    for path in glob.glob(os.path.join(PLANS_DIR, "*.json")):
+        if path.endswith(("_pre_context.json", "_backup.json")):
+            continue
         try:
-            with open(plan_path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 plan = json.load(f)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Ошибка чтения плана: {e}")
-            
-    from core.plan_generator import normalize_plan_statuses
-    return normalize_plan_statuses(plan)
+        except Exception:
+            continue
+        case = (plan.get("plan_title_info") or {}).get("номер_дела") or os.path.splitext(os.path.basename(path))[0]
+        plans.setdefault(case, plan)
+
+    cases = []
+    for case, plan in plans.items():
+        stats = _plan_response(plan)["statistics"]
+        if not stats["plan_update_required"]:
+            continue
+        title = plan.get("plan_title_info") or {}
+        cases.append({
+            "case_number": case,
+            "article": title.get("статья_ук_рк", ""),
+            "executor": main_executor(plan),
+            "message": (f"План по делу №{case} исполнен на {stats['percent_executed']:g}% "
+                        f"({stats['executed']} из {stats['total']}, просрочено {stats['overdue']}) — необходимо обновить план."),
+            **stats,
+        })
+    cases.sort(key=lambda c: (c["update_required_since"] or "", c["case_number"]))
+    return {"threshold_percent": update_threshold_percent(), "count": len(cases), "cases": cases}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1136,6 +1215,15 @@ def api_save_edited_plan(case_number: str, plan_data: dict):
         plan_data["last_edited_at"] = datetime.now().isoformat()
         plan_data["last_edited_by"] = "user_visual_edit"
 
+        # Отметку о достижении порога исполнения ведёт сервер: фронт мог её не прислать —
+        # берём из сохранённого плана, чтобы дата уведомления руководству не сбрасывалась
+        from core.plan_statistics import NOTICE_KEY, plan_statistics
+        previous = existing_plan or _load_saved_plan(case_number) or {}
+        if previous.get(NOTICE_KEY):
+            plan_data[NOTICE_KEY] = previous[NOTICE_KEY]
+        else:
+            plan_data.pop(NOTICE_KEY, None)
+
         # Сохраняем отредактированный план
         save_plan_to_json(plan_data)
 
@@ -1148,6 +1236,7 @@ def api_save_edited_plan(case_number: str, plan_data: dict):
             "saved_to": plan_path,
             "backup_created": backup_path,
             "actions_count": actions_count,
+            "statistics": plan_statistics(plan_data),
             "last_edited_at": plan_data["last_edited_at"],
             "message": (
                 f"План дела №{case_number} успешно сохранён ({actions_count} пунктов). "
