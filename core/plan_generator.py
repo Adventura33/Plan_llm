@@ -1590,6 +1590,20 @@ def sanitize_filename(name: str) -> str:
     return name or 'unknown'
 
 
+def end_with_period(text: str) -> str:
+    """
+    Единое окончание пункта плана — точка: «…материалов СОРМ,» → «…материалов СОРМ.», «…(составить протокол)» →
+    «…(составить протокол).», текст без знака в конце получает точку. Точка выбрана потому, что часть пунктов
+    заканчивается сокращением («Иванова И.И.», «2025 г.») и без точки единый вид недостижим.
+    Повторный вызов текст не меняет.
+    """
+    t = re.sub(r'[\s,;:—–-]+$', '', text or '')
+    if not t:
+        return t
+    t = re.sub(r'\.{2,}$', '.', t)  # «…лицах..» — опечатка
+    return t if t[-1] in '.!?…' else t + '.'
+
+
 def normalize_plan_statuses(plan: dict) -> dict:
     """
     Гарантирует, что каждый пункт плана содержит поле 'статус'.
@@ -1599,8 +1613,21 @@ def normalize_plan_statuses(plan: dict) -> dict:
     for action in plan.get('actions', []):
         if not action.get('статус'):
             action['статус'] = 'Не исполнен'
+        # Единое окончание текста в графах «Следственные действия» и «Цель» — точка
+        for field in ('действие', 'цель'):
+            if isinstance(action.get(field), str):
+                action[field] = end_with_period(action[field])
     if plan.get('actions'):
-        plan['actions'] = executed_to_end(plan['actions'], (plan.get('case_data') or {}).get('проведённые_действия'))
+        case_data = plan.get('case_data') or {}
+        # «Изучение материалов» и «Определение круга лиц» закрываются по косвенным признакам — здесь же, чтобы
+        # правило действовало при генерации, дозагрузке, смене статусов и правке плана одинаково
+        from core.conducted_actions import close_analytical_items
+        close_analytical_items(plan['actions'], case_data.get('проведённые_действия'),
+                               registered=case_data.get('дата_регистрации_ердр') or '')
+        # Раскладка по блокам (исполненные — в последнем блоке) и сквозная нумерация — в одном месте
+        from core.plan_blocks import arrange_by_blocks
+        plan['actions'] = arrange_by_blocks(plan['actions'], case_data.get('проведённые_действия'),
+                                            figurants=case_data.get('фигуранты') or '')
     return plan
 
 
@@ -1630,16 +1657,14 @@ def _answer_date(request: dict, done: list, conducted: list) -> str:
     return min(dates, key=_date_key) if dates else ''
 
 
-def executed_to_end(actions: list, conducted: list = None) -> list:
+def executed_order(done: list, conducted: list = None) -> list:
     """
-    Исполненные пункты — в конце плана, по дате документа-основания (без даты — последними);
-    неисполненные сохраняют свой порядок (блоки УПК, цепочки запросов). Нумерация — сквозная заново.
-    Запрос без даты стоит сразу перед ответом на него (дата в графе «Срок» не выдумывается).
-    Действует для первичного плана, дозагрузки, обновления статусов и правок через API.
+    Порядок исполненных пунктов (последний блок плана, core.plan_blocks.arrange_by_blocks): по дате
+    документа-основания, без даты — последними. Запрос без даты стоит сразу перед ответом на него
+    (дата в графе «Срок» не выдумывается).
     """
     from core.procedural_validator import _chain_step
-    pending = [a for a in actions if a.get('статус') != 'Исполнен']
-    done = [a for a in actions if a.get('статус') == 'Исполнен']
+    done = list(done)
     keys = {}
     for a in done:
         key = _date_key(a.get('срок'))
@@ -1652,15 +1677,17 @@ def executed_to_end(actions: list, conducted: list = None) -> list:
                 continue
         keys[id(a)] = key + (1,)
     done.sort(key=lambda a: keys[id(a)])
-    ordered = pending + done
-    for idx, action in enumerate(ordered, start=1):
-        action['номер'] = idx
-    return ordered
+    return done
+
+
 def save_plan_to_json(plan: dict, plans_dir: str = PLANS_DIR) -> str:
     """Сохраняет план в {plans_dir}/{номер_дела}.json и в базу данных PostgreSQL. Возвращает путь."""
     os.makedirs(plans_dir, exist_ok=True)
     # Нормализуем статусы перед записью — поле 'статус' обязательно для каждого пункта
     plan = normalize_plan_statuses(plan)
+    # Счётчики блоков считаются при отдаче плана (как и статистика), в файле и БД не хранятся
+    from core.plan_blocks import BLOCKS_KEY
+    plan.pop(BLOCKS_KEY, None)
     # Отметка о достижении порога исполнения (уведомление руководству обновить план)
     from core.plan_statistics import update_plan_notice
     update_plan_notice(plan)

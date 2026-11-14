@@ -65,10 +65,14 @@ def _safe_upload_name(filename: Optional[str]) -> str:
 
 
 def _plan_response(plan: dict) -> dict:
-    """JSON плана для клиента: статусы, порядок пунктов и статистика исполнения на сегодня (plan['statistics'])."""
+    """
+    JSON плана для клиента: статусы, пункты по блокам (у пункта — «блок_номер», «блок_код», «блок»),
+    блоки со счётчиками (plan['blocks']) и статистика исполнения на сегодня (plan['statistics']).
+    """
+    from core.plan_blocks import attach_blocks
     from core.plan_generator import normalize_plan_statuses
     from core.plan_statistics import attach_statistics
-    return attach_statistics(normalize_plan_statuses(plan))
+    return attach_statistics(attach_blocks(normalize_plan_statuses(plan)))
 
 
 def _load_saved_plan(case_number: str) -> Optional[dict]:
@@ -380,6 +384,7 @@ def api_generate_plan(
             return _plan_response(investigation_plan)
 
         if response_format == "text":
+            investigation_plan = _plan_response(investigation_plan)
             info = investigation_plan.get("plan_title_info", {})
             actions = investigation_plan.get("actions", [])
             lines = [
@@ -392,7 +397,11 @@ def api_generate_plan(
                 "\n" + "="*50 + "\n",
                 "СЛЕДСТВЕННЫЕ ДЕЙСТВИЯ И МЕРОПРИЯТИЯ:\n"
             ]
+            current_block = None
             for action in actions:
+                if action.get("блок_номер") != current_block:
+                    current_block = action.get("блок_номер")
+                    lines.append(f"--- {action.get('блок', '')} ---\n")
                 lines.append(f"{action.get('номер', '')}. Действие: {action.get('действие', '')}")
                 lines.append(f"   Цель: {action.get('цель', '')}")
                 lines.append(f"   Срок: {action.get('срок', '')}")
@@ -957,7 +966,11 @@ class ManualStatusRequest(BaseModel):
     """
 
     role: Optional[str] = "investigator"
-    """Роль пользователя: 'manager' или 'investigator'. Для аудита."""
+    """
+    Роль пользователя: 'manager' (руководитель) или 'investigator' (следователь). Пишется в историю статусов.
+    Вручную статус меняет только руководитель, но это право проверяет бэк сайта (автор методики, 14.11.2026):
+    сервис пользователей не знает и запрос по роли не отклоняет.
+    """
 
     comment: Optional[str] = None
     """Опциональный комментарий к изменению статуса (сохраняется в плане)."""
@@ -966,7 +979,8 @@ class ManualStatusRequest(BaseModel):
 @app.post("/api/manual_status/{case_number}")
 def api_manual_status(case_number: str, req: ManualStatusRequest):
     """
-    Ручное обновление статуса пункта плана руководителем или следователем.
+    Ручное обновление статуса пункта плана. По правилу статус вручную меняет только руководитель;
+    кто руководитель, проверяет бэк сайта до вызова — здесь роль только записывается в историю.
 
     Ключевое поведение:
       - Если new_status = 'Не исполнен' (и locked не указан) → автоматически
@@ -1006,6 +1020,11 @@ def api_manual_status(case_number: str, req: ManualStatusRequest):
                 plan = json.load(f)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Ошибка чтения плана: {e}")
+
+    # Номер пункта клиент берёт из GET /api/plan, где план разложен по блокам и пронумерован заново.
+    # План, сохранённый до появления блоков, хранит прежнюю нумерацию — приводим к той же раскладке
+    from core.plan_generator import normalize_plan_statuses
+    plan = normalize_plan_statuses(plan)
 
     # Ищем нужный пункт
     actions = plan.get("actions", [])
@@ -1086,6 +1105,14 @@ def api_get_plan(case_number: str):
     Возвращает текущий план расследования в формате JSON по номеру дела.
     Включает статусы, флаги блокировки, историю изменений статусов
     и статистику исполнения на сегодня (поле statistics, см. GET /api/plan/{case_number}/statistics).
+
+    План разложен по блокам (пункты в actions уже стоят в порядке блоков, нумерация сквозная):
+      - у каждого пункта: «блок_номер» — номер блока, «блок_код» — постоянный код блока, «блок» — название;
+      - blocks — блоки плана по порядку: number, code, title, total, executed, overdue,
+        first_number, last_number, action_numbers (номера пунктов блока). Пустых блоков в списке нет.
+    Коды блоков: analysis, evidence, requests, finance, assets, witnesses, expertise, suspects, arrest,
+    verification, executed (исполненные пункты — последний блок, по дате документа).
+    Заголовок блока выводится перед пунктом, у которого «блок_номер» отличается от предыдущего.
     """
     case_number = _safe_case_id(case_number)
     plan = _load_saved_plan(case_number)
