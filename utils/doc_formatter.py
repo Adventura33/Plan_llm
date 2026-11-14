@@ -128,10 +128,25 @@ def create_investigation_plan_doc(plan_data, output_path):
                 paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
         # Заполнение таблицы данными
-        # Исполненные пункты — в конце (и для планов, сохранённых до этого правила)
-        from core.plan_generator import executed_to_end
-        for action in executed_to_end([dict(a) for a in plan_data.get("actions", [])],
-                                      (plan_data.get("case_data") or {}).get("проведённые_действия")):
+        # Пункты — по блокам, исполненные — последним блоком (и для планов, сохранённых до этого правила);
+        # перед первым пунктом каждого блока — строка-заголовок на всю ширину таблицы
+        # Документ строится по тому же виду плана, что отдаёт API (normalize_plan_statuses): блоки, статусы,
+        # единое окончание текста пунктов. Сам plan_data не меняется
+        from core.plan_generator import normalize_plan_statuses
+        shown = normalize_plan_statuses({"actions": [dict(a) for a in plan_data.get("actions", [])],
+                                         "case_data": plan_data.get("case_data") or {}})
+        current_block = None
+        for action in shown["actions"]:
+            if action.get("блок_номер") != current_block:
+                current_block = action.get("блок_номер")
+                header_cells = table.add_row().cells
+                merged = header_cells[0].merge(header_cells[-1])
+                merged.text = str(action.get("блок", ""))
+                for paragraph in merged.paragraphs:
+                    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    for run in paragraph.runs:
+                        run.bold = True
+
             # Создаем новую строку
             new_row = table.add_row()
             cells = new_row.cells

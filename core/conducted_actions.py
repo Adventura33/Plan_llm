@@ -82,6 +82,8 @@ _ORGANS = [
 
 # Тип документа → проведённое действие. Порядок важен: более специфичные первыми.
 _DOC_TYPES = [
+    # «Протокол проверки и уточнения показаний на месте»
+    ('проверка_показаний', r'пр\w{0,2}токол\w*\s+проверк\w*\s+(?:и\s+уточнени\w*\s+)?показаний'),
     ('очная_ставка', r'пр\w{0,2}токол\w*\s+очн\w*\s+ставк'),
     ('допрос', r'пр\w{0,2}токол\w*\s+(?:о\s+)?(?:дополнительн\w+\s+)?допрос|жауап\s+алу\s+хаттам'),
     ('обыск', r'пр\w{0,2}токол\w*\s+(?:личного\s+)?обыск|тінту\s+хаттам'),
@@ -118,6 +120,7 @@ _NAME_ONLY_TYPES = {'запрос', 'подозреваемый', 'квалиф�
                     'сио_псо', 'установление'}
 
 _TYPE_LABEL = {
+    'проверка_показаний': 'Проведена проверка показаний на месте',
     'очная_ставка': 'Проведена очная ставка',
     'допрос': 'Проведён допрос',
     'обыск': 'Проведён обыск',
@@ -152,6 +155,7 @@ _PERSON_LABELS = [
     (r'(?:выемк\w*|обыск\w*)\s+(?:у|в\s+жилище|по\s+месту\s+жительства)\s+(?:гр\.?\s*|гражданин\w*\s+)?', 150),
     (r'представител\w+\s+юридическ\w+\s+лица\s*[–—-]?\s*потерпевш\w*\s*', 3),
     (r'очн\w*\s+ставк\w*\s+между\s+', 3),
+    (r'показаний\s+(?:на\s+месте\s+)?(?:подозреваем\w+|обвиняем\w+|свидетел\w+|потерпевш\w+)\s+', 3),
 ]
 
 # Латинские буквы-двойники внутри русских слов («Пpотокол» с латинской p) — к кириллице
@@ -501,7 +505,8 @@ def detect_conducted_actions(documents: List[Dict], officials: Optional[List[Dic
             'документ': title if name_type or _DOC_WORD.search(title) else '',
             'файл': original_filename,
         }
-        if doc_type in ('допрос', 'очная_ставка', 'обыск', 'выемка', 'арест', 'потерпевший', 'санкция'):
+        if doc_type in ('допрос', 'очная_ставка', 'обыск', 'выемка', 'арест', 'потерпевший', 'санкция',
+                        'проверка_показаний'):
             if doc_type == 'допрос':
                 # Роль — из названия протокола или «допросил в качестве …», а не из любого упоминания в тексте
                 in_role = re.search(r'в\s+качестве\s+([^:\n]{3,60})', head, re.IGNORECASE)
@@ -509,6 +514,8 @@ def detect_conducted_actions(documents: List[Dict], officials: Optional[List[Dic
                     or _role_of(text_probe)
                 # «От дачи показаний отказываюсь» (в бланке стоит и «…не отказываюсь» — это не отказ)
                 item['отказ'] = bool(_REFUSAL.search(text))
+                # Место работы и должность из анкетной части — для пунктов «Допросить бухгалтера ТОО «…»» без ФИО
+                item['должность'] = _workplace(head)
             if doc_type == 'очная_ставка':
                 m = re.search(r'между\s+', head, re.IGNORECASE)
                 persons = [p for p in _persons_in(head[m.end():m.end() + 200] if m else head)
@@ -561,6 +568,15 @@ def detect_conducted_actions(documents: List[Dict], officials: Optional[List[Dic
             item['органы'] = _organs(name_probe) or _organs(text_probe)
         if doc_type == 'санкция':
             item['роль'] = 'обыска' if re.search(r'обыск', probe) else 'выемки'
+        if doc_type == 'арест':
+            # Постановление о временном ограничении распоряжения имуществом — не арест: закрывает свой пункт
+            item['ограничение'] = _is_restriction_title(name_probe) \
+                or (not re.search(r'арест', name_probe) and _is_restriction_title(text_probe))
+        if doc_type == 'осмотр':
+            # Что осмотрено — по названию и началу протокола («… документов, поступивших из …»)
+            item['органы'] = _organs(name_probe) or _organs(text_probe)
+        if doc_type in ('обыск', 'выемка', 'санкция', 'осмотр'):
+            item['адреса'] = _addresses(head)
         result.append(item)
 
     if result:
@@ -570,6 +586,94 @@ def detect_conducted_actions(documents: List[Dict], officials: Optional[List[Dic
             print(f"     • {c['тип']}{(' ' + c['роль']) if c['роль'] else ''}{(' — ' + who) if who else ''}"
                   f"{' [ОТКАЗ от дачи показаний]' if c.get('отказ') else ''} ({c['документ'] or c['файл']})")
     return result
+
+
+_WORKPLACE = re.compile(
+    r'(?:место\s+работы(?:\s+или\s+уч[её]бы)?(?:\s*,\s*должность)?|род\s+занятий(?:\s+или\s+должность)?|должность'
+    r'|жұмыс\s+орны[^:<\n]{0,30})\s*:?\s*(?:</th>\s*<td[^>]*>)?\s*([^\n<]{2,200})', re.IGNORECASE)
+
+
+def _workplace(head: str) -> str:
+    """Место работы и должность допрошенного из анкетной части протокола (поля бланка, в т.ч. в таблице)."""
+    found = [m.group(1).strip(' .;-–—').lower() for m in _WORKPLACE.finditer(head or '')]
+    return '; '.join(dict.fromkeys(f for f in found if re.search(r'[a-zа-яёәғқңөұүһі]{3,}', f)))[:300]
+
+
+def _is_restriction_title(text_lower: str) -> bool:
+    return bool(re.search(r'временн\w*\s+ограничени|ограничени\w*\s+(?:на\s+)?распоряжени', text_lower or ''))
+
+
+def _addresses(text: str) -> List[str]:
+    """Адреса из документа («… по адресу: г. Астана, ул. Мира, д. 1») в виде ключей «город|улица|номера»."""
+    from core.procedural_validator import _address_key
+    keys = []
+    for m in re.finditer(r'по\s+адресу\s*:?\s*([^\n]{5,160})', text or '', re.IGNORECASE):
+        key = _address_key(m.group(1))
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _is_restriction_doc(c: Dict) -> bool:
+    """Документ вида «арест» — постановление о временном ограничении (у записей до 14.11.2026 — по названию)."""
+    if 'ограничение' in c:
+        return bool(c['ограничение'])
+    title = _norm(f"{c.get('документ') or ''} {c.get('файл') or ''}").lower()
+    return _is_restriction_title(title) and not re.search(r'арест', title)
+
+
+# Банк в пункте без названия банка («в банки второго уровня», «банковские выписки»)
+_BANK_WORD = re.compile(r'\bбву\b|банк(?!рот)|\bbank\b|выпис\w*\s+(?:по\s+)?(?:сч[её]т|движени)|движени\w*\s+денежн',
+                        re.IGNORECASE)
+_BANK_ORGANS = {'kaspi', 'halyk', 'forte', 'jusan', 'bereke', 'bcc', 'freedom', 'eurasian', 'otbasy', 'home'}
+# «Вынести постановление о получении банковских выписок … и ходатайствовать о его санкционировании»
+_BANK_DECREE = re.compile(r'постановлени\w*\s+о\s+(?:получении|истребовании)\s+[^.;]{0,60}?(?:банковск|выпис)', re.IGNORECASE)
+# Изучение первичных материалов: «Проанализировать рапорт об обнаружении сведений …», «Изучить заявление …»
+_STUDY_ITEM = re.compile(r'\s*(?:проанализировать|изучить|изучение|анализ)\s+(?:\w+\s+){0,2}?'
+                         r'(?:рапорт|заявлени|материал\w*\s+(?:дела|проверки|доследственн)|акт\w*\s+(?:ревизи|проверк))',
+                         re.IGNORECASE)
+# Анализ движения денег по счетам: «Проанализировать сведения о движении денежных средств …»
+_MONEY_ANALYSIS = re.compile(r'\s*(?:проанализировать|провести\s+анализ|анализ)\b', re.IGNORECASE)
+
+
+def _is_bank_doc(c: Dict) -> bool:
+    title = _norm(f"{c.get('документ') or ''} {c.get('файл') or ''}").lower()
+    return bool(set(c.get('органы') or []) & _BANK_ORGANS or _BANK_WORD.search(title))
+
+
+def _addressee_names(text: str) -> List[str]:
+    """Названия в кавычках из адресата запроса: «Направить запрос в ТОО «А» о …», «… по запросу из ТОО «А» (…)»."""
+    m = re.search(r'(?:запрос\w*\s+в\s+|по\s+запросу\s+из\s+|истребовать\s+из\s+)(.+?)'
+                  r'(?:\s+(?:о|об|на|для|в\s+отношении)\s|\s*\(|[.;]|$)', text or '', re.IGNORECASE | re.DOTALL)
+    return _quoted_names(m.group(1)) if m else []
+
+
+def _named_in_title(names: List[str], c: Dict) -> bool:
+    """Организация-адресат названа в названии документа («запрос ТОО А», «Ответ с ТОО «А»»)."""
+    title = _org_tokens(_norm(f"{c.get('документ') or ''} {c.get('файл') or ''}"))
+    return any(_org_tokens(n) and _org_tokens(n) <= title for n in names)
+
+
+def _status_type(text_lower: str) -> Optional[str]:
+    """
+    Вид пункта плана для сопоставления с документами дела: _action_type и формулировки, которые он не различает
+    (на порядок пунктов и цепочки не влияет — там свой _chain_step).
+    """
+    t = text_lower.strip()
+    if _is_restriction_title(t) and not re.search(r'арест', t):
+        return 'ограничение'
+    if re.search(r'проверк\w*\s+(?:и\s+уточнени\w*\s+)?показаний', t) and not re.search(r'очн\w*\s+ставк', t):
+        return 'проверка_показаний'
+    found = _action_type(t)
+    if found:
+        return found
+    if re.match(r'изъять\b', t):
+        return 'выемка'
+    if re.match(r'истребовать\b', t):
+        return 'ответ'
+    if _BANK_DECREE.search(t):
+        return 'санкция'
+    return None
 
 
 def refused_persons(conducted: List[Dict]) -> Dict[str, str]:
@@ -632,6 +736,27 @@ def _action_type(text_lower: str) -> Optional[str]:
     return None
 
 
+# Должность в пункте «Допросить <должность> ТОО «…»»; общие слова (представитель, сотрудник) должность не уточняют
+_POSITION_STEMS = ['бухгалтер', 'директор', 'руководител', 'учредител', 'кассир', 'менеджер', 'юрист', 'инженер',
+                   'прораб', 'кладовщик', 'водител', 'секретар', 'заместител']
+_STAFF_WORD = re.compile(r'представител|сотрудник|работник|должностн\w+\s+лиц|' + '|'.join(_POSITION_STEMS))
+
+
+def _same_position(text_lower: str, orgs: set, c: Dict) -> bool:
+    """
+    Пункт «Допросить бухгалтера ТОО «А» …» без ФИО и протокол допроса: в анкетной части протокола место работы —
+    та же организация, а если в пункте названа должность — та же должность. Подозреваемых так не закрывают.
+    """
+    position = c.get('должность') or ''
+    head = re.split(r'[«"]', text_lower, maxsplit=1)[0]
+    if not position or not orgs or not _STAFF_WORD.search(head) or c.get('роль') in ('подозреваемого', 'обвиняемого'):
+        return False
+    if not any(_org_tokens(o) and _org_tokens(o) <= _org_tokens(position) for o in orgs):
+        return False
+    wanted = [s for s in _POSITION_STEMS if s in head]
+    return not wanted or any(s in position for s in wanted)
+
+
 def match_conducted(action_text: str, conducted: List[Dict]) -> Optional[Dict]:
     """
     Находит проведённое действие, соответствующее пункту плана.
@@ -641,7 +766,7 @@ def match_conducted(action_text: str, conducted: List[Dict]) -> Optional[Dict]:
     if not action_text or not conducted:
         return None
     t = _norm(action_text).lower()
-    a_type = _action_type(t)
+    a_type = _status_type(t)
     if not a_type:
         return None
 
@@ -653,6 +778,21 @@ def match_conducted(action_text: str, conducted: List[Dict]) -> Optional[Dict]:
         persons = {mentions[0]['key']}
     orgs = set(_quoted_names(action_text))
     role = _action_role(t, mentions) if a_type == 'допрос' else ''
+    address = ''
+    if a_type in ('обыск', 'выемка', 'санкция') and not persons:
+        from core.procedural_validator import _address_key
+        address = _address_key(_norm(action_text))
+
+    if a_type == 'ограничение':
+        # Постановление о временном ограничении закрывает пункт, когда оно вынесено по всем названным в пункте
+        # лицам (один пункт может перечислять нескольких), либо по организации из пункта
+        decrees = [c for c in conducted if c.get('тип') == 'арест' and _is_restriction_doc(c)]
+        covered = {k for c in decrees for k in c.get('лица') or []}
+        for c in decrees:
+            if (persons and persons <= covered and persons & set(c.get('лица') or [])) \
+                    or (not persons and _orgs_overlap(orgs, c.get('организации'))):
+                return c
+        return None
 
     for c in conducted:
         c_type = c.get('тип')
@@ -668,15 +808,27 @@ def match_conducted(action_text: str, conducted: List[Dict]) -> Optional[Dict]:
             elif not persons and role in ('эксперта', 'специалиста', 'представителя потерпевшего', 'потерпевшего') \
                     and role == c.get('роль'):
                 return c
+            elif not persons and _same_position(t, orgs, c):
+                # «Допросить бухгалтера ТОО «А» …» без ФИО — допрошен работник этой организации в этой должности
+                return c
         elif a_type == 'очная_ставка' and c_type == 'очная_ставка':
             if len(persons & c_persons) >= 2 or (c_persons and c_persons <= persons):
                 return c
+        elif a_type == 'проверка_показаний' and c_type == 'проверка_показаний':
+            if persons & c_persons:
+                return c
+        elif a_type == 'арест' and c_type == 'арест' and _is_restriction_doc(c):
+            continue  # временное ограничение — не арест: у него свой пункт плана
         elif a_type in ('обыск', 'выемка', 'арест', 'потерпевший') and c_type == a_type:
             if (persons & c_persons) or (_orgs_overlap(orgs, c.get('организации'))):
                 return c
+            # «Произвести обыск в квартире по адресу: …» без лица — протокол обыска по тому же адресу
+            if address and address in (c.get('адреса') or []):
+                return c
         elif a_type == 'санкция' and c_type == 'санкция':
             same_kind = ('обыск' in t) == (c.get('роль') == 'обыска')
-            if same_kind and ((persons & c_persons) or (_orgs_overlap(orgs, c.get('организации')))):
+            if same_kind and ((persons & c_persons) or (_orgs_overlap(orgs, c.get('организации')))
+                              or (address and address in (c.get('адреса') or []))):
                 return c
         elif a_type == 'назначение_экспертизы' and c_type in ('назначение_экспертизы', 'заключение'):
             if c.get('специалист'):
@@ -701,9 +853,27 @@ def match_conducted(action_text: str, conducted: List[Dict]) -> Optional[Dict]:
             a_organs = set(_organs(t))
             if a_organs & set(c.get('органы') or []):
                 return c
+            if not a_organs:
+                # Адресат не из списка органов: банк без названия («в банки второго уровня», «банковские выписки») —
+                # запрос в банк или ответ банка; организация в кавычках — документ с её названием в заголовке
+                if _BANK_WORD.search(t):
+                    # владелец счёта, если он назван и в пункте, и в документе (в названии — ФИО, в тексте —
+                    # организации), должен быть тем же
+                    title_persons = {p['key'] for p in _persons_in(_norm(f"{c.get('документ') or ''} {c.get('файл') or ''}"))}
+                    if _is_bank_doc(c) and not (persons and title_persons and not (persons & title_persons)) \
+                            and not (orgs and c.get('организации') and not _orgs_overlap(orgs, c.get('организации'))):
+                        return c
+                elif _named_in_title(_addressee_names(action_text), c):
+                    return c
         elif a_type in ('осмотр', 'вещдок') and c_type == a_type:
             if (persons & c_persons) or (_orgs_overlap(orgs, c.get('организации'))):
                 return c
+            # «Произвести осмотр полученных сведений по запросу из КГД …» — протокол осмотра сведений этого органа;
+            # «… осмотр полученных банковских выписок …» — протокол осмотра выписок
+            if a_type == 'осмотр' and re.search(r'полученн|по\s+запросу|\bответ(?!ств)', t):
+                c_organs = set(c.get('органы') or _organs(_norm(f"{c.get('документ') or ''} {c.get('файл') or ''}").lower()))
+                if set(_organs(t)) & c_organs or (not _organs(t) and _BANK_WORD.search(t) and _is_bank_doc(c)):
+                    return c
             # «Осмотр изъятых документов» / «вещдоки по изъятому» без конкретики: если в деле ровно один
             # такой документ, это он (иначе исполненный пункт остаётся без даты, а документ дублируется)
             same_type = [x for x in conducted if x.get('тип') == a_type]
@@ -725,6 +895,8 @@ def conducted_action_item(c: Dict, fio_investigator: str) -> Dict:
         details = f" между {' и '.join(c['фио'])}"
     elif c['тип'] in ('обыск', 'выемка') and c['фио']:
         details = f" у {', '.join(c['фио'])}"
+    elif c['тип'] == 'проверка_показаний' and c['фио']:
+        details = f" ({', '.join(c['фио'])})"
     elif c['тип'] == 'санкция':
         details = f" {c['роль'] or 'выемки'}" + (f" ({', '.join(c['фио'])})" if c['фио'] else '')
     elif c['тип'] in ('подозреваемый', 'квалификация', 'мера_пресечения', 'розыск', 'защитник',
@@ -780,7 +952,7 @@ def apply_conducted_statuses(actions: List[Dict], conducted: List[Dict], fio_inv
     done = [a for a in actions if a.get('статус') == STATUS_DONE]
     for act in done:
         t = act.get('действие', '').lower()
-        a_type = _action_type(t)
+        a_type = _status_type(t)
         persons, orgs = _ids(act.get('действие', ''))
         organs = set(_organs(t))
         for other in actions:
@@ -788,13 +960,18 @@ def apply_conducted_statuses(actions: List[Dict], conducted: List[Dict], fio_inv
                 continue
             o_text = other.get('действие', '')
             o_lower = o_text.lower()
+            o_type = _status_type(o_lower)
             linked = False
-            if a_type in ('обыск', 'выемка') and _action_type(o_lower) == 'санкция' \
+            if a_type in ('обыск', 'выемка') and o_type == 'санкция' \
                     and ('обыск' in o_lower) == (a_type == 'обыск'):
                 o_persons, o_orgs = _ids(o_text)
                 linked = bool((persons & o_persons) or _orgs_overlap(orgs, o_orgs))
-            elif a_type == 'ответ' and _action_type(o_lower) == 'ответ' and organs:
+            elif a_type == 'ответ' and o_type == 'ответ' and organs:
                 linked = bool(organs & set(_organs(o_lower)))
+            elif a_type == 'ответ' and o_type == 'санкция' and _BANK_DECREE.search(o_lower) and _BANK_WORD.search(t):
+                # Банк выдал выписки по счетам тех же лиц (организаций) — постановление о их получении вынесено
+                o_persons, o_orgs = _ids(o_text)
+                linked = bool((persons & o_persons) or _orgs_overlap(orgs, o_orgs))
             if linked:
                 other['статус'] = STATUS_DONE
                 other['основание_статуса'] = act.get('основание_статуса', '')
@@ -806,6 +983,119 @@ def apply_conducted_statuses(actions: List[Dict], conducted: List[Dict], fio_inv
             actions.append(conducted_action_item(c, fio_investigator))
         if missing:
             print(f"  ➕ [Проведено] Добавлено в план проведённых действий: {len(missing)}")
+    return actions
+
+
+# Материалы, с которыми дело поступило к следователю или которые он получил от других: заключение, ответ на запрос,
+# сведения из баз, рапорт об установлении. Остальные документы — действия и решения самого следователя
+_NOT_INVESTIGATOR_STEP = {'заключение', 'ответ', 'сио_псо', 'установление'}
+# Решения, в которых круг причастных лиц уже назван
+_CIRCLE_FIXED = {'подозреваемый', 'квалификация'}
+
+
+def _dmy(value):
+    m = re.match(r'\s*(\d{1,2})\.(\d{1,2})\.(\d{4})', str(value or ''))
+    try:
+        return (int(m.group(3)), int(m.group(2)), int(m.group(1))) if m else None
+    except ValueError:
+        return None
+
+
+def close_analytical_items(actions: List[Dict], conducted: Optional[List[Dict]] = None, registered: str = '') -> List[Dict]:
+    """
+    Аналитические первые пункты плана не оставляют своего документа, поэтому их исполнение устанавливается
+    по косвенным признакам (автор методики, 14.11.2026):
+      • «Изучение заявления, рапорта …» — исполнено, когда по делу проведено следственное действие: без изучения
+        материалов его не провести. Считаются документы следователя (протокол, постановление, запрос) с датой
+        не раньше регистрации в ЕРДР (registered) и исполненные пункты плана — следственные действия;
+        заключение, ответы на запросы и сведения из баз, с которыми дело поступило, не считаются;
+      • «Определение круга лиц …» — исполнено, когда вынесено постановление о признании подозреваемым или
+        о квалификации деяния либо исполнена проверка круга лиц по БД СИО ПСО;
+      • «Проанализировать рапорт (заявление, материалы проверки) …» — то же изучение первичных материалов:
+        признак тот же, что у «Изучения»;
+      • «Проанализировать сведения о движении денежных средств (банковские выписки) …» — исполнено, когда
+        составлен протокол осмотра банковских выписок тех же лиц (организаций): анализ фиксируется в нём.
+    Пункты, статус которых руководитель закрепил вручную (статус_заблокирован), не трогаются; исполненный пункт
+    обратно не открывается. «основание_статуса» — признак, по которому пункт закрыт.
+    """
+    from core.procedural_validator import _is_mandatory
+
+    def _kind(a):
+        t = re.sub(r'^\s*\d+(?:\.\d+)*\.?\s*[).]?\s*', '', a.get('действие', '') or '').strip().lower()
+        if not _is_mandatory(a):
+            if _MONEY_ANALYSIS.match(t) and _BANK_WORD.search(t):
+                return 'анализ_денег'
+            return 'изучение' if _STUDY_ITEM.match(t) else None
+        return 'изучение' if t.startswith('изучение') else 'круг_лиц' if t.startswith('определение') else 'проверка_круга'
+
+    def _ids(text):
+        return ({p['key'] for p in find_person_mentions(normalize_text(_norm(text)))}, set(_quoted_names(text)))
+
+    def _same_holder(a_ids, b_persons, b_orgs):
+        # лица (организации) названы с обеих сторон — должны совпадать; с одной стороны не названы — не мешает
+        persons, orgs = a_ids
+        if persons and b_persons and not (persons & set(b_persons)):
+            return False
+        return not (orgs and b_orgs and not _orgs_overlap(orgs, b_orgs))
+
+    kinds = {id(a): _kind(a) for a in actions}
+    open_items = [a for a in actions if kinds[id(a)] in ('изучение', 'круг_лиц', 'анализ_денег')
+                  and a.get('статус') != STATUS_DONE and not a.get('статус_заблокирован')]
+    if not open_items:
+        return actions
+
+    reg = _dmy(registered)
+    steps, circle = [], []  # (дата для сортировки, дата текстом, признак)
+    for c in conducted or []:
+        day = _dmy(c.get('дата'))
+        name = c.get('документ') or _TYPE_LABEL.get(c.get('тип'), 'документ')
+        dated = f"{name} от {c['дата']}" if c.get('дата') else name
+        if c.get('тип') in _CIRCLE_FIXED:
+            circle.append((day or (9999,), c.get('дата') or '', f"круг лиц определён в документе: {dated}"))
+        if c.get('тип') == 'сио_псо':
+            circle.append((day or (9999,), c.get('дата') or '', f"проведена проверка круга лиц по БД СИО ПСО: {dated}"))
+        if c.get('тип') not in _NOT_INVESTIGATOR_STEP and not (reg and (not day or day < reg)):
+            steps.append((day or (9999,), c.get('дата') or '', f"проведено следственное действие: {dated}"))
+    for a in actions:
+        if a.get('статус') != STATUS_DONE:
+            continue
+        text = a.get('действие', '') or ''
+        # «срок» исполненного пункта — дата документа, если пункт закрыт по документу; у закрытого вручную в нём
+        # остаётся плановый срок, поэтому дата признака тогда не указывается
+        day = _dmy(a.get('срок')) if a.get('основание_статуса') else None
+        date_text = a.get('срок') if day else ''
+        if kinds[id(a)] == 'проверка_круга':
+            circle.append((day or (9999,), date_text, "исполнена проверка круга лиц по БД СИО ПСО"))
+        elif kinds[id(a)] is None and _status_type(text.lower()) not in (None, 'сио_псо', 'установление') \
+                and not (reg and day and day < reg):
+            steps.append((day or (9999,), date_text, f"исполнен пункт плана: {text[:90].rstrip()}"))
+
+    def _statement_inspections(item):
+        """Осмотры банковских выписок тех же лиц (организаций): протоколы из дела и исполненные пункты плана."""
+        ids, found = _ids(item.get('действие', '') or ''), []
+        for c in conducted or []:
+            if c.get('тип') == 'осмотр' and _is_bank_doc(c) and _same_holder(ids, c.get('лица'), c.get('организации')):
+                name = c.get('документ') or _TYPE_LABEL['осмотр']
+                found.append((_dmy(c.get('дата')) or (9999,), c.get('дата') or '',
+                              f"осмотрены банковские выписки: {name}" + (f" от {c['дата']}" if c.get('дата') else '')))
+        for a in actions:
+            text = a.get('действие', '') or ''
+            if a.get('статус') == STATUS_DONE and _status_type(text.lower()) == 'осмотр' and _BANK_WORD.search(text) \
+                    and _same_holder(ids, *_ids(text)):
+                day = _dmy(a.get('срок')) if a.get('основание_статуса') else None
+                found.append((day or (9999,), a.get('срок') if day else '', f"исполнен пункт плана: {text[:90].rstrip()}"))
+        return found
+
+    for a in open_items:
+        kind = kinds[id(a)]
+        found = steps if kind == 'изучение' else circle if kind == 'круг_лиц' else _statement_inspections(a)
+        if not found:
+            continue
+        _key, when, basis = min(found, key=lambda x: x[0])
+        a['статус'] = STATUS_DONE
+        a['основание_статуса'] = f"косвенный признак — {basis}"
+        a['срок'] = when  # дата признака; если её нет — срок не указывается, как у других исполненных без даты
+        print(f"  ✅ [Косвенно] «{(a.get('действие') or '')[:60]}» — {basis}")
     return actions
 
 
